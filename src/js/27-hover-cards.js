@@ -97,36 +97,49 @@
 
   async function drawTabThumb(canvas, tab, token) {
     const browser = tab.linkedBrowser;
-    let picture = null;
+    let captured = false;
     try {
-      const { PageThumbs } = ChromeUtils.importESModule("resource://gre/modules/PageThumbs.sys.mjs");
-      if (PageThumbs.captureTabPreviewThumbnail) {
-        picture = await PageThumbs.captureTabPreviewThumbnail(browser);
+      const { PageThumbs } = ChromeUtils.importESModule(
+        "resource://gre/modules/PageThumbs.sys.mjs",
+      );
+      if (typeof PageThumbs?.captureTabPreviewThumbnail === "function") {
+        // captureTabPreviewThumbnail draws directly onto the canvas and returns
+        // true on success, false on failure — it does not return an image object.
+        captured = await PageThumbs.captureTabPreviewThumbnail(browser, canvas);
       }
     } catch (err) {
-      picture = null;
+      captured = false;
     }
-    if (!picture) {
+    if (!captured) {
+      // Fallback: drawSnapshot returns an ImageBitmap-like object we draw ourselves.
+      let picture = null;
       const windowGlobal = browser?.browsingContext?.currentWindowGlobal;
       const width = browser?.clientWidth;
       if (windowGlobal && width) {
         try {
-          picture = await windowGlobal.drawSnapshot(new DOMRect(0, 0, width, width * TAB_THUMB_RATIO), canvas.width / width, "white");
+          picture = await windowGlobal.drawSnapshot(
+            new DOMRect(0, 0, width, width * TAB_THUMB_RATIO),
+            canvas.width / width,
+            "white",
+          );
         } catch (err) {
           picture = null;
         }
       }
+      if (!picture || token !== thumbToken || !canvas.isConnected) {
+        picture?.close?.();
+        return;
+      }
+      const ctx = canvas.getContext("2d");
+      const sw = picture.width;
+      const sh = Math.min(picture.height, sw * TAB_THUMB_RATIO);
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(picture, 0, 0, sw, sh, 0, 0, canvas.width, canvas.height);
+      picture.close?.();
+    } else if (token !== thumbToken || !canvas.isConnected) {
+      // captureTabPreviewThumbnail succeeded but the card is stale — clear it.
+      canvas.getContext("2d").clearRect(0, 0, canvas.width, canvas.height);
     }
-    if (!picture || token !== thumbToken || !canvas.isConnected) {
-      picture?.close?.();
-      return;
-    }
-    const ctx = canvas.getContext("2d");
-    const sw = picture.width;
-    const sh = Math.min(picture.height, sw * TAB_THUMB_RATIO);
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    ctx.drawImage(picture, 0, 0, sw, sh, 0, 0, canvas.width, canvas.height);
-    picture.close?.();
   }
 
   function fillTabCard(card, tab) {
