@@ -4,6 +4,26 @@ Every release of Zia, newest first. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.101.3] — 2026-10-19
+
+### Changed
+
+- On Windows and Linux, Zen's "Hide window controls" is left as you have it
+  again: 2.101.2 turned it off, so the window buttons stayed on screen, which
+  wasn't wanted.
+
+### Fixed
+
+- On Windows, with Zen's single toolbar and the window controls hidden, the
+  corner where the window buttons show opens them, so pointing straight at
+  close works; only the window's very edge above it did (thanks Gin The
+  Cerberus).
+
+- On Windows, a space's emoji or icon sits level with its name and the
+  sidebar's buttons. An old Windows rule still pushed it 2px down, from when
+  the whole name sat lower, and 2.101.2's lift didn't outweigh it, so it
+  stayed low (thanks Gin The Cerberus).
+
 ## [2.101.2] — 2026-10-19
 
 ### Changed
