@@ -282,6 +282,8 @@
     safely("watchScrollInput", watchScrollInput);
     safely("createTitleElement", createTitleElement);
     safely("watchTitleOnly", watchTitleOnly);
+    safely("watchCenteredAddress", watchCenteredAddress);
+    safely("watchScreenshotButtons", watchScreenshotButtons);
     safely("addDownloadProgress", addDownloadProgress);
     safely("flyFirstDownloadToButton", flyFirstDownloadToButton);
     safely("flyDownloadRows", flyDownloadRows);
@@ -329,6 +331,9 @@
 
     gBrowser.addTabsProgressListener({
       onStateChange(browser, webProgress, request, stateFlags) {
+        if (webProgress.isTopLevel && stateFlags & STATE_START) {
+          blankLoadingNewTabAddress(browser, request);
+        }
         if (!webProgress.isTopLevel || !(stateFlags & STATE_IS_WINDOW)) {
           return;
         }

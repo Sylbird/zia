@@ -523,6 +523,23 @@
   margin-inline: 0 !important;
 }
 
+/* The ⋯ menu (Firefox's app menu) is hidden, as Dia and Arc have none; it's
+   shown again in Zia's settings. Kept in its place at no width rather than
+   taken out: Firefox's notices (an update ready, an add-on added) still
+   point at it, and opened from the keyboard the menu still has its corner. */
+@media not -moz-pref("zia.toolbar.menu-button") {
+  #PanelUI-button {
+    width: 0 !important;
+    min-width: 0 !important;
+    max-width: 0 !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    overflow: hidden !important;
+    opacity: 0 !important;
+    pointer-events: none !important;
+  }
+}
+
 #zen-toggle-compact-mode {
   list-style-image: url("chrome://sine/content/zia/icons/sidebar.svg") !important;
 }
@@ -687,6 +704,13 @@
   color: var(--zia-toolbar-ink, currentColor) !important;
 }
 
+/* Extension buttons in the toolbar spaced as Zen's own beside them: each
+   took 2px either side the others didn't, so the gaps grew wherever an
+   extension sat (31px a button, as share, back and the menu take) */
+#zen-appcontent-navbar-wrapper #nav-bar-customization-target > :is([id$="-browser-action"], [id$="-BAP"]) {
+  margin-inline: 0.5px !important;
+}
+
 @media -moz-pref("zia.urlbar.zia-look") {
   :root #urlbar[breakout-extend]:not([zia-classic]) {
     color-scheme: dark !important;
@@ -724,6 +748,13 @@
     #urlbar:not([zen-floating-urlbar="true"]) :is(.urlbar-input, #zia-url-title, #zia-url-plain) {
       text-align: center !important;
       justify-content: center !important;
+    }
+
+    /* ...on the toolbar's middle rather than the bar's, padded on one side by
+       twice the gap between them (zia.uc.js) */
+    #urlbar:not([zen-floating-urlbar="true"], [breakout-extend]) :is(.urlbar-input, #zia-url-title, #zia-url-plain) {
+      padding-left: max(0px, 2 * var(--zia-center-shift, 0px)) !important;
+      padding-right: max(0px, -2 * var(--zia-center-shift, 0px)) !important;
     }
   }
 }

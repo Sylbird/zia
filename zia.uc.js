@@ -1485,6 +1485,45 @@
 
   let openOffset = 0;
 
+  // Optional (zia.urlbar.center-text): the address centred on the toolbar, not in the bar,
+  // which the buttons either side push off the toolbar's middle; and held there as the
+  // bar's own buttons show and hide on hover (re-centred in what was left, it slid aside
+  // each time). Measured as either changes size, before it's drawn. Only the toolbar's
+  // bar, closed: in the sidebar (Zen's single toolbar) or open, it's as it was.
+  function watchCenteredAddress() {
+    const urlbar = gURLBar.textbox || document.getElementById("urlbar");
+    const box = gURLBar.inputField?.parentNode;
+    const toolbar = document.getElementById("zen-appcontent-navbar-wrapper");
+    if (!urlbar || !box || !toolbar) {
+      return;
+    }
+    const update = () => {
+      let shift = 0;
+      if (
+        Services.prefs.getBoolPref("zia.urlbar.center-text", false) &&
+        root.getAttribute("zen-single-toolbar") !== "true" &&
+        !urlbar.hasAttribute("breakout-extend") &&
+        urlbar.getAttribute("zen-floating-urlbar") !== "true"
+      ) {
+        const bar = box.getBoundingClientRect();
+        const card = toolbar.getBoundingClientRect();
+        if (bar.width && card.width) {
+          // (a fifth of the bar at most either way: a long address keeps most of its room)
+          const most = bar.width / 5;
+          shift = Math.max(-most, Math.min(most, card.left + card.width / 2 - (bar.left + bar.width / 2)));
+        }
+      }
+      setStyle(urlbar, "--zia-center-shift", Math.abs(shift) >= 1 ? `${Math.round(shift)}px` : null);
+    };
+    const observer = new ResizeObserver(update);
+    observer.observe(box, { box: "border-box" });
+    observer.observe(toolbar, { box: "border-box" });
+    new MutationObserver(update).observe(urlbar, { attributes: true, attributeFilter: ["breakout-extend", "zen-floating-urlbar"] });
+    watchPrefs("zia.urlbar.center-text", update);
+    window.addEventListener("unload", () => observer.disconnect());
+    update();
+  }
+
   function desiredOpenTop() {
     return parseFloat(getComputedStyle(root).getPropertyValue("--zia-urlbar-open-top")) || 0;
   }
@@ -2062,33 +2101,23 @@
   // bar, already open to type in, so it had to be deleted first (Zen 1.23
   // writes a page's address in as it loads, even with the bar in use). It's
   // kept empty instead, until something's typed there or in the page.
-  function keepNewTabAddressEmpty(browser, location) {
-    const tab = gBrowser.getTabForBrowser?.(browser);
-    if (!tab?.ziaBlankAddress || !searchHomeUrl || !location) {
-      return;
-    }
-    if (tab.ziaTypedInPage || location.spec === "about:newtab" || location.spec === "about:blank") {
-      return;
-    }
-    let home = null;
+  function isSearchHome(uri) {
     try {
-      home = Services.io.newURI(searchHomeUrl);
+      const home = Services.io.newURI(searchHomeUrl);
+      return uri.prePath === home.prePath && uri.filePath === home.filePath;
     } catch (err) {
-      return;
+      return false;
     }
-    // (the search page itself: a search from it, or anywhere else, shows
-    // its address as usual from then on)
-    if (location.prePath !== home.prePath || location.filePath !== home.filePath) {
-      tab.ziaBlankAddress = false;
-      return;
-    }
+  }
+
+  function clearNewTabAddress(browser, tab, uri) {
     const clear = () => {
       if (gBrowser.selectedTab !== tab || tab.ziaTypedInPage || !tab.ziaBlankAddress) {
         return;
       }
       // (what's in the bar is still the page's own address, not typing)
       const shown = gURLBar.value || "";
-      if (shown && (gURLBar.valueIsTyped || !location.spec.includes(shown.replace(/^https?:\/\//, "").replace(/\/$/, "")))) {
+      if (shown && (gURLBar.valueIsTyped || !uri.spec.includes(shown.replace(/^https?:\/\//, "").replace(/\/$/, "")))) {
         tab.ziaBlankAddress = false;
         return;
       }
@@ -2097,6 +2126,42 @@
     };
     clear();
     requestAnimationFrame(clear);
+  }
+
+  function keepNewTabAddressEmpty(browser, location) {
+    const tab = gBrowser.getTabForBrowser?.(browser);
+    if (!tab?.ziaBlankAddress || !searchHomeUrl || !location) {
+      return;
+    }
+    if (tab.ziaTypedInPage || location.spec === "about:newtab" || location.spec === "about:blank") {
+      return;
+    }
+    // (the search page itself: a search from it, or anywhere else, shows
+    // its address as usual from then on)
+    if (!isSearchHome(location)) {
+      tab.ziaBlankAddress = false;
+      return;
+    }
+    clearNewTabAddress(browser, tab, location);
+  }
+
+  // Firefox shows the address a new tab is loading as soon as the load
+  // starts, so the search page's sat in the bar until it arrived, a second
+  // or two on a slow connection: it's cleared from the start of the load
+  function blankLoadingNewTabAddress(browser, request) {
+    const tab = gBrowser.getTabForBrowser?.(browser);
+    if (!tab?.ziaBlankAddress || tab.ziaTypedInPage || !searchHomeUrl) {
+      return;
+    }
+    let uri = null;
+    try {
+      uri = request?.QueryInterface(Ci.nsIChannel).originalURI;
+    } catch (err) {
+      return;
+    }
+    if (uri && isSearchHome(uri)) {
+      clearNewTabAddress(browser, tab, uri);
+    }
   }
 
   function closeNewTabUrlbar(tab) {
@@ -12058,7 +12123,32 @@
       jumpToEnd(folder);
     };
 
-    const finishDrop = (tab, target) => {
+    // Several selected tabs let go together: the others (folded into the dragged one) land
+    // beside it in the order they had, as Firefox lays out a multiple drop. Firefox's own
+    // drop placed them by its measure of the list, which Zia's drag had moved, so they
+    // went to its end.
+    const finishDrop = (tab, target, party = null) => {
+      placeDropped(tab, target);
+      const at = party?.indexOf(tab) ?? -1;
+      if (at < 0 || !tab.isConnected || tab.group?.hasAttribute("split-view-group")) {
+        return;
+      }
+      const pinned = !target.below;
+      let anchor = tab;
+      for (const other of party.slice(at + 1)) {
+        pinFor(other, pinned);
+        placeAfter(other, anchor);
+        anchor = other;
+      }
+      anchor = tab;
+      for (const other of party.slice(0, at).reverse()) {
+        pinFor(other, pinned);
+        placeBefore(other, anchor);
+        anchor = other;
+      }
+    };
+
+    const placeDropped = (tab, target) => {
       if (!tab?.isConnected) {
         return;
       }
@@ -14223,11 +14313,13 @@
         } else if (tab && !drag.folder && !drag.away && drag.target?.hand) {
           const target = drag.target;
           // Zia places it, Zen's drop not run: told to drop it where it was, Zen still took a tab
-          // in a closed folder out of it for a frame (its favicon flashing left of where it lands)
-          if (!tab.multiselected) {
-            event.preventDefault();
-            event.stopPropagation();
-          }
+          // in a closed folder out of it for a frame (its favicon flashing left of where it lands).
+          // Several selected go with it (finishDrop), in the order they're in now.
+          const party = tab.multiselected
+            ? gBrowser.selectedTabs.filter((t) => t.isConnected && !t.hasAttribute("zen-essential") && !t.group?.hasAttribute?.("split-view-group"))
+            : null;
+          event.preventDefault();
+          event.stopPropagation();
           heldFolder = target.folder || null;
           heldPinned = !target.below;
           pendingFinish = true;
@@ -14235,7 +14327,7 @@
           // room made for it in a folder had closed and it showed outside, full width, for a frame
           const run = () => {
             try {
-              finishDrop(tab, target);
+              finishDrop(tab, target, party);
               // (its width put right as it moves: the row's new width showed
               // first otherwise, 14px narrower)
               refitLanding?.();
@@ -18242,6 +18334,92 @@
     return { manager, provider };
   }
 
+  // The screenshot buttons as Zia's tiles: flat, a squircle, a hairline, lighter
+  // on hover, as the site panel's (25c-screenshots.css draws the card round
+  // them). They're drawn inside the element, out of reach of chrome.css, so
+  // their look is put in there as each one appears. Full page, Firefox's
+  // primary button, is a tile like the other rather than a bright one.
+  const SCREENSHOT_BUTTON_RULES = `
+    moz-button-group {
+      gap: 6px !important;
+    }
+    .screenshot-button,
+    .mini-window-option {
+      appearance: none !important;
+      margin: 0 !important;
+      border: none !important;
+      border-radius: var(--zia-glass-button-radius, 10px) !important;
+      corner-shape: var(--zia-squircle, round) !important;
+      background-color: color-mix(in srgb, currentColor 7%, transparent) !important;
+      box-shadow: inset 0 0 0 0.5px color-mix(in srgb, currentColor 6%, transparent) !important;
+      color: inherit !important;
+      font-weight: 500 !important;
+      stroke: color-mix(in srgb, currentColor 30%, transparent) !important;
+      transition: background-color 0.12s ease, transform 0.12s ease !important;
+    }
+    .screenshot-button:hover,
+    .mini-window-option:hover {
+      background-color: color-mix(in srgb, currentColor 12%, transparent) !important;
+    }
+    .screenshot-button:hover:active,
+    .mini-window-option:hover:active {
+      background-color: color-mix(in srgb, currentColor 20%, transparent) !important;
+      transform: scale(0.97);
+    }
+    .screenshot-button:focus-visible,
+    .mini-window-option:focus-visible {
+      outline: 2px solid color-mix(in srgb, currentColor 40%, transparent) !important;
+      outline-offset: 1px !important;
+    }
+    .mini-window-option[data-default] {
+      background-color: color-mix(in srgb, currentColor 12%, transparent) !important;
+    }
+  `;
+
+  function watchScreenshotButtons() {
+    let sheet = null;
+    const style = (el) => {
+      const shadow = el?.shadowRoot;
+      if (!shadow || shadow.ziaStyled) {
+        return;
+      }
+      try {
+        if (!sheet) {
+          sheet = new window.CSSStyleSheet();
+          sheet.replaceSync(SCREENSHOT_BUTTON_RULES);
+        }
+        shadow.adoptedStyleSheets = [...shadow.adoptedStyleSheets, sheet];
+        shadow.ziaStyled = true;
+      } catch (err) {
+        noteError("screenshots: buttons", err);
+      }
+    };
+    // (each put in the window as a screenshot starts, over the page or, in older
+    // Firefox, in the window's pop-ups; drawn inside as it goes in, so styled after)
+    const find = (node) => {
+      if (node.nodeType !== Node.ELEMENT_NODE) {
+        return;
+      }
+      if (node.localName === "screenshots-buttons") {
+        style(node);
+      } else if (node.firstElementChild) {
+        node.querySelectorAll("screenshots-buttons").forEach(style);
+      }
+    };
+    const observer = new MutationObserver((records) => {
+      for (const record of records) {
+        record.addedNodes.forEach(find);
+      }
+    });
+    for (const id of ["tabbrowser-tabpanels", "mainPopupSet"]) {
+      const where = document.getElementById(id);
+      if (where) {
+        observer.observe(where, { childList: true, subtree: true });
+      }
+    }
+    window.addEventListener("unload", () => observer.disconnect());
+    document.querySelectorAll("screenshots-buttons").forEach(style);
+  }
   function safely(name, fn) {
     try {
       fn();
@@ -18526,6 +18704,8 @@
     safely("watchScrollInput", watchScrollInput);
     safely("createTitleElement", createTitleElement);
     safely("watchTitleOnly", watchTitleOnly);
+    safely("watchCenteredAddress", watchCenteredAddress);
+    safely("watchScreenshotButtons", watchScreenshotButtons);
     safely("addDownloadProgress", addDownloadProgress);
     safely("flyFirstDownloadToButton", flyFirstDownloadToButton);
     safely("flyDownloadRows", flyDownloadRows);
@@ -18573,6 +18753,9 @@
 
     gBrowser.addTabsProgressListener({
       onStateChange(browser, webProgress, request, stateFlags) {
+        if (webProgress.isTopLevel && stateFlags & STATE_START) {
+          blankLoadingNewTabAddress(browser, request);
+        }
         if (!webProgress.isTopLevel || !(stateFlags & STATE_IS_WINDOW)) {
           return;
         }
