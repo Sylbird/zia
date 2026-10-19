@@ -4,6 +4,29 @@ Every release of Zia, newest first. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.101.1] — 2026-10-19
+
+### Changed
+
+- Compact mode's sidebar has Zia's card corners, as its hover cards and
+  pop-ups do, the same all round: the window's own corner could cut into the
+  one beside it, which came out rounder than the rest (thanks @OneGunBullet).
+- In a light space, compact mode's sidebar, nearly white and see-through,
+  has stronger tab names; they read faint there (thanks Briski).
+
+### Fixed
+
+- With Zen's single toolbar and the window controls hidden, the bar with the
+  window buttons grows and fades in and out again: Zia's toolbar colour fade
+  had replaced Zen's animation, so it came and went at once (thanks Gin The
+  Cerberus).
+- Where the window buttons aren't beside it (Windows and Linux), the space's
+  name and icon sit level with the sidebar's buttons rather than 1.5px below
+  them (thanks Gin The Cerberus).
+- With "Show the space's name above the tabs, as Zen does" on, the sidebar's
+  top row lets go of Zia's arrangement: its empty slot for the name kept the
+  row's buttons pushed to the end (thanks Gin The Cerberus).
+
 ## [2.101.0] — 2026-10-19
 
 ### Changed
