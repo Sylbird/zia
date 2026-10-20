@@ -1802,6 +1802,8 @@
 @media -moz-pref("zia.tabs.no-glow") {
   :root:not(#zia-none) {
     --zia-active-glow-color: transparent;
+    /* (and a light space's soft shadow in its place, 23-light-spaces.css) */
+    --zia-light-tab-lift: transparent;
     & .tabbrowser-tab:not([zen-essential])[visuallyselected] > .tab-stack > .tab-background,
     & tab-group[split-view-group] > .tab-group-container {
       box-shadow: none !important;
@@ -8250,10 +8252,14 @@ zen-folder .tab-reset-button {
     color: color-mix(in srgb, var(--zia-sidebar-ink) 90%, transparent) !important;
   }
 
+  /* the selected tab's glow, as a light space has it: light can't glow on
+     white, so a soft shadow lifts the white card off the sidebar instead
+     (gone with the glow, zia.tabs.no-glow) */
   & .tabbrowser-tab:not([zen-essential])[visuallyselected] > .tab-stack > .tab-background {
     box-shadow:
       0 0 0 0.5px rgba(0, 0, 0, 0.06),
-      0 1px 3px rgba(0, 0, 0, 0.08) !important;
+      0 1px 3px rgba(0, 0, 0, 0.08),
+      0 4px 14px var(--zia-light-tab-lift, rgba(0, 0, 0, 0.08)) !important;
   }
 
   & .tabbrowser-tab:not([zen-essential], [visuallyselected]):hover > .tab-stack > .tab-background {
@@ -10063,6 +10069,16 @@ zen-workspace-creation {
 
   zen-library .zen-library-media-thumb[zia-media-loading] {
     opacity: 0 !important;
+  }
+}
+
+/* The Library's chosen-section tile on a gentler spring than Zia's own, as
+   it stretches and squashes on the way too (28s-ultra.js) */
+@media -moz-pref("zia.ultra") {
+  zen-library .zia-library-rail:not([instant]) {
+    transition:
+      transform var(--zia-spring-time) cubic-bezier(0.3, 1.12, 0.5, 1),
+      height var(--zia-spring-time) cubic-bezier(0.3, 1.12, 0.5, 1) !important;
   }
 }
 /* Zia glow: the bottom-edge glow of voice-glow 0.3.0 (VoiceBeam), ported without React.
