@@ -251,6 +251,14 @@
     );
   }
 
+  // Read off the window, the page's top shows whatever's over it: with the address
+  // pop-up open (or Zen's floating bar) the toolbar took the pop-up's colour, as a
+  // scroll of Settings read it again (#444). Not read while something's over it.
+  function chromeOverPage() {
+    const urlbar = gURLBar?.textbox || document.getElementById("urlbar");
+    return !!(urlbar?.hasAttribute("breakout-extend") || urlbar?.getAttribute("zen-floating-urlbar") === "true" || gURLBar?.view?.isOpen);
+  }
+
   function sampleShownTop(browser) {
     const box = browser.getBoundingClientRect();
     if (!box.width || !box.height) {
@@ -421,6 +429,9 @@
       return;
     }
 
+    if (showsThrough(browser) && chromeOverPage()) {
+      return;
+    }
     const id = ++colorRequestId;
     let reading = null;
     try {
@@ -486,7 +497,8 @@
   async function checkColor() {
     const browser = gBrowser.selectedBrowser;
     if (checking || document.hidden || !siteColorOn() || !browser || isErrorPage(browser) || isLoading(browser) ||
-        scrollTimer || scrollSampling || !colorCache.has(browser) || colorPick || manualSiteColor(browser)) {
+        scrollTimer || scrollSampling || !colorCache.has(browser) || colorPick || manualSiteColor(browser) ||
+        (showsThrough(browser) && chromeOverPage())) {
       return;
     }
     checking = true;
@@ -1499,6 +1511,16 @@
     }
     const update = () => {
       let shift = 0;
+      // Opened, the text stays where it was, centred on the toolbar as it was closed: the
+      // last measure is kept (centred in the opened bar instead, it jumped aside as the bar
+      // was clicked, #443). Not with the opened pop-up's text from the left (an option).
+      if (
+        urlbar.hasAttribute("breakout-extend") &&
+        urlbar.getAttribute("zen-floating-urlbar") !== "true" &&
+        !Services.prefs.getBoolPref("zia.urlbar.center-text.pop-up-left", false)
+      ) {
+        return;
+      }
       if (
         Services.prefs.getBoolPref("zia.urlbar.center-text", false) &&
         root.getAttribute("zen-single-toolbar") !== "true" &&
@@ -1519,7 +1541,7 @@
     observer.observe(box, { box: "border-box" });
     observer.observe(toolbar, { box: "border-box" });
     new MutationObserver(update).observe(urlbar, { attributes: true, attributeFilter: ["breakout-extend", "zen-floating-urlbar"] });
-    watchPrefs("zia.urlbar.center-text", update);
+    watchPrefs(["zia.urlbar.center-text", "zia.urlbar.center-text.pop-up-left"], update);
     window.addEventListener("unload", () => observer.disconnect());
     update();
   }
@@ -2224,20 +2246,27 @@
     });
   }
 
+  // A new tab's address bar, empty and with the cursor in it as Firefox leaves it, is let
+  // go of unless "New tabs start in the address bar" is on: the page has the typing (its
+  // own search box). For any new tab page, an extension's or Zen's as well as the search
+  // engine's: left with the cursor, Zen floated the bar over the middle of the page,
+  // the toolbar's address field left empty.
   function closeNewTabUrlbar(tab) {
-    if (!searchHomeUrl || !newTabSearchEnabled()) {
-      if (compactToolbarHidden()) {
+    if (focusAddressBarOnNewTab()) {
+      if (searchHomeUrl && newTabSearchEnabled()) {
+        keepNewTabUrlbar(tab);
+      } else if (compactToolbarHidden()) {
         floatNewTabUrlbar(tab);
       }
       return;
     }
-    if (focusAddressBarOnNewTab()) {
-      keepNewTabUrlbar(tab);
-      return;
-    }
-    requestAnimationFrame(() => {
+    let touched = false;
+    const touch = () => (touched = true);
+    gURLBar?.textbox?.addEventListener("mousedown", touch, { once: true });
+    gURLBar?.inputField?.addEventListener("input", touch, { once: true });
+    const letGo = () => {
       try {
-        if (!gURLBar?.focused || gBrowser.selectedTab !== tab) {
+        if (touched || !gURLBar?.focused || gBrowser.selectedTab !== tab || gURLBar.value) {
           return;
         }
         gURLBar.view?.close();
@@ -2246,7 +2275,16 @@
       } catch (err) {
         noteError("new tabs: closeNewTabUrlbar", err);
       }
-    });
+    };
+    requestAnimationFrame(letGo);
+    // (an extension's page, arriving, can put the cursor back in the bar)
+    for (const ms of [250, 700]) {
+      setTimeout(letGo, ms);
+    }
+    setTimeout(() => {
+      gURLBar?.textbox?.removeEventListener("mousedown", touch);
+      gURLBar?.inputField?.removeEventListener("input", touch);
+    }, 800);
   }
 
   function watchNewTabPage() {
@@ -6147,7 +6185,9 @@
     const view = urlbar.querySelector(".urlbarView");
     const background = urlbar.querySelector(".urlbar-background");
     const rows = urlbar.querySelectorAll(".urlbarView-row");
-    const last = rows[rows.length - 1];
+    // (the last row that shows: Firefox keeps rows it isn't using, hidden, at the end, and
+    // measured by one of those, at nowhere, the pop-up was shrunk up past the last rows)
+    const last = [...rows].reverse().find((row) => row.getBoundingClientRect().height > 0);
     if (!view || !background || !last) {
       return;
     }
