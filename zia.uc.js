@@ -2078,6 +2078,10 @@
       if (gBrowser.selectedTab !== tab || tab.ziaTypedInPage) {
         return;
       }
+      if (compactToolbarHidden()) {
+        floatUrlbar();
+        return;
+      }
       if (!gURLBar.focused) {
         gURLBar.focus();
         gURLBar.select();
@@ -2164,8 +2168,44 @@
     }
   }
 
+  // Compact mode with Zen's top toolbar hidden: Zen brings the toolbar out while
+  // the address bar has the cursor, so a new tab's, ready to type in, held it out
+  // till the tab was left
+  function compactToolbarHidden() {
+    return (
+      root.getAttribute("zen-compact-mode") === "true" &&
+      root.getAttribute("zen-single-toolbar") !== "true" &&
+      root.getAttribute("zia-urlbar-position") !== "bottom" &&
+      Services.prefs.getBoolPref("zen.view.compact.hide-toolbar", false)
+    );
+  }
+
+  // ...so there it opens floating over the new tab, as Zen's own new tab does,
+  // and the toolbar stays hidden (16-compact-mode.css). (Zen's way in: an empty
+  // search, which opens the bar's list.)
+  function floatUrlbar() {
+    try {
+      if (!gURLBar.focused || !gURLBar.hasAttribute("breakout-extend")) {
+        gURLBar.search("");
+      }
+    } catch (err) {
+      noteError("new tabs: floatUrlbar", err);
+    }
+  }
+
+  function floatNewTabUrlbar(tab) {
+    requestAnimationFrame(() => {
+      if (gBrowser.selectedTab === tab && gURLBar.focused && !gURLBar.value) {
+        floatUrlbar();
+      }
+    });
+  }
+
   function closeNewTabUrlbar(tab) {
     if (!searchHomeUrl || !newTabSearchEnabled()) {
+      if (compactToolbarHidden()) {
+        floatNewTabUrlbar(tab);
+      }
       return;
     }
     if (focusAddressBarOnNewTab()) {
@@ -2897,9 +2937,28 @@
     );
   }
 
-  // Clicking a kept inner folder name opened it with everything round it still hidden,
-  // so nothing showed: the folders it's in open too.
+  // Clicking the name of a folder kept inside a closed folder (it holds the tab the
+  // closed one shows) opens it where it is: its tabs show under its name, and the rest
+  // of the closed folder stays hidden (zia-open-in-closed, 06-folders-and-sidebar.css).
+  // The folders round it had opened too, bringing back every other folder in them.
+  // Clicked again, it closes back to the tab it shows.
+  const OPEN_IN_CLOSED = "zia-open-in-closed";
+
   function openKeptFolderNames() {
+    const inShowingClosedFolder = (folder) => {
+      for (let el = folder.parentElement?.closest(FOLDER_SELECTOR); el; el = el.parentElement?.closest(FOLDER_SELECTOR)) {
+        if (el.hasAttribute("collapsed") && el.hasAttribute("has-active")) {
+          return true;
+        }
+      }
+      return false;
+    };
+    const unmarkWithin = (folder) => {
+      for (const el of folder.querySelectorAll(`[${OPEN_IN_CLOSED}]`)) {
+        el.removeAttribute(OPEN_IN_CLOSED);
+      }
+    };
+
     window.addEventListener(
       "click",
       (event) => {
@@ -2908,42 +2967,61 @@
         }
         const label = event.target?.closest?.(".tab-group-label-container");
         const folder = label?.parentElement;
-        if (!isFolder(folder) || !folder.hasAttribute("collapsed") || !folder.querySelector('.tabbrowser-tab:is([selected], [folder-active="true"])')) {
+        if (!isFolder(folder) || folder.hasAttribute(OPEN_IN_CLOSED) || !folder.querySelector('.tabbrowser-tab:is([selected], [folder-active="true"])')) {
           return;
         }
         if (event.target.closest(".tab-group-label-container toolbarbutton, .tab-close-button, .tab-reset-button, [anonid], button")) {
           return;
         }
-        const outer = [];
-        for (let el = folder.parentElement?.closest(FOLDER_SELECTOR); el; el = el.parentElement?.closest(FOLDER_SELECTOR)) {
-          if (el.hasAttribute("collapsed")) {
-            outer.unshift(el);
-          }
-        }
-        if (!outer.length) {
+        if (!inShowingClosedFolder(folder)) {
           return;
         }
-        event.stopPropagation();
-        event.preventDefault();
-        // One at a time, outermost first: asked to open while the folder
-        // round it was still opening, Zen let it be
-        const openNext = (list) => {
-          const el = list.shift();
-          if (!el) {
-            return;
+        folder.setAttribute(OPEN_IN_CLOSED, "true");
+        // (open already, hidden with the rest as the folder round it closed: shown as
+        // it is, rather than Zen closing it)
+        if (!folder.hasAttribute("collapsed")) {
+          event.stopPropagation();
+          event.preventDefault();
+          const hidden = (folder.allItems || []).filter((item) => item.style.height === "0px" || item.style.opacity === "0");
+          if (hidden.length) {
+            window.gZenFolders?.styleCleanup?.(hidden);
           }
-          el.collapsed = false;
-          requestAnimationFrame(() => {
-            const moving = [el.groupStartElement, el.groupContainer]
-              .filter(Boolean)
-              .flatMap((node) => node.getAnimations());
-            Promise.all(moving.map((a) => a.finished.catch(() => {}))).then(() => openNext(list));
-          });
-        };
-        openNext([...outer, folder]);
+        }
       },
       true
     );
+
+    // Closed again, or a folder round it opened or closed, or the closed folder no
+    // longer showing a tab, it's back to how Zen has it
+    window.addEventListener(
+      "TabGroupCollapse",
+      (event) => {
+        if (isFolder(event.target)) {
+          event.target.removeAttribute(OPEN_IN_CLOSED);
+          unmarkWithin(event.target);
+        }
+      },
+      true
+    );
+    window.addEventListener(
+      "TabGroupExpand",
+      (event) => {
+        if (isFolder(event.target)) {
+          unmarkWithin(event.target);
+        }
+      },
+      true
+    );
+    const tabs = gBrowser.tabContainer;
+    if (tabs) {
+      new MutationObserver((records) => {
+        for (const { target } of records) {
+          if (isFolder(target) && !target.hasAttribute("has-active")) {
+            unmarkWithin(target);
+          }
+        }
+      }).observe(tabs, { subtree: true, attributes: true, attributeFilter: ["has-active"] });
+    }
   }
 
   // Pinned tabs tucked away keep showing the open tab among them, as a closed folder
@@ -6022,7 +6100,7 @@
     // used any more; the Tabler ones have their own file.
     IOUtils.remove(PathUtils.join(PathUtils.profileDir, "zia-icon-vectors.json"), { ignoreAbsent: true }).catch(() => {});
     set("zen.widget.mac.mono-window-controls", false);
-    set("zen.urlbar.replace-newtab", floatingNewTab());
+    set("zen.urlbar.replace-newtab", !Services.prefs.getBoolPref("zia.newtab.real-tab", true));
     set("zen.splitView.enable-tab-drop", !Services.prefs.getBoolPref("zia.split.drop-cards", true));
     set("browser.urlbar.trimHttps", true);
     // answers in the address bar: maths, and units and time zones (Firefox's own)
@@ -6507,22 +6585,6 @@
     "zia.split.drop-cards",
     "zia.page.rounding",
   ];
-  // A new tab is a real tab (Zia's option) unless the top toolbar is hidden in
-  // compact mode: there the address bar, focused as the tab opened, brought the
-  // hidden toolbar out and kept it till another tab was chosen, so Zen's floating
-  // address bar takes its place
-  function floatingNewTab() {
-    if (!Services.prefs.getBoolPref("zia.newtab.real-tab", true)) {
-      return true;
-    }
-    return (
-      root.getAttribute("zen-compact-mode") === "true" &&
-      root.getAttribute("zen-single-toolbar") !== "true" &&
-      root.getAttribute("zia-urlbar-position") !== "bottom" &&
-      Services.prefs.getBoolPref("zen.view.compact.hide-toolbar", false)
-    );
-  }
-
   const WATCHED_OPTIONS = ["zia.urlbar.zia-look", "zia.urlbar.dia-style", "zia.newtab.real-tab", "zia.toolbar.site-color", "zia.split.drop-cards"];
 
   function watchOptions() {
@@ -6537,7 +6599,7 @@
       // drops on the page back to Zen's own split.
       try {
         const defaults = Services.prefs.getDefaultBranch("");
-        defaults.setBoolPref("zen.urlbar.replace-newtab", floatingNewTab());
+        defaults.setBoolPref("zen.urlbar.replace-newtab", !Services.prefs.getBoolPref("zia.newtab.real-tab", true));
         defaults.setBoolPref("zen.splitView.enable-tab-drop", !Services.prefs.getBoolPref("zia.split.drop-cards", true));
       } catch (err) {
         noteError("options: apply (2)", err);
@@ -6550,13 +6612,6 @@
     };
     apply();
     watchPrefs(WATCHED_OPTIONS, onChange);
-    // (compact mode coming and going, and its toolbar hidden or not, change which
-    // a new tab is)
-    watchPrefs("zen.view.compact.hide-toolbar", apply);
-    new MutationObserver(apply).observe(root, {
-      attributes: true,
-      attributeFilter: ["zen-compact-mode", "zen-single-toolbar", "zia-urlbar-position"],
-    });
   }
 
   const FEATURES = ["media-player", "find-bar", "icon-picker", "undo-close", "folder-icon-suggest", "tab-hover-cards", "tab-numbers"];
