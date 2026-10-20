@@ -9645,6 +9645,55 @@
       true
     );
   }
+
+  // A name field in the sidebar (a group's, a folder's, a tab's, Zen's or Advanced
+  // Tab Groups') says it's waiting for a name while empty: a new group's, opened
+  // empty, showed nothing to say it could be typed in.
+  function hintNameFields() {
+    document.addEventListener(
+      "focusin",
+      (event) => {
+        const field = event.target;
+        if (field?.id === "tab-label-input" && !field.hasAttribute("placeholder")) {
+          field.setAttribute("placeholder", "Type a name");
+        }
+      },
+      true
+    );
+  }
+
+  // In compact mode, a name entered (Enter) leaves the sidebar out a moment longer,
+  // to see it take, rather than it sliding away the instant it's done. Zen's own
+  // brief showing of the sidebar (after a space switch) does it.
+  const NAMED_HOLD_MS = 1000;
+
+  function holdSidebarAfterNaming() {
+    window.addEventListener(
+      "keydown",
+      (event) => {
+        if (
+          event.key !== "Enter" ||
+          event.isComposing ||
+          event.target?.id !== "tab-label-input" ||
+          root.getAttribute("zen-compact-mode") !== "true"
+        ) {
+          return;
+        }
+        const compact = window.gZenCompactModeManager;
+        if (typeof compact?.flashElement !== "function") {
+          return;
+        }
+        try {
+          // (up now, as the name's field goes: Zen's own puts it up a frame later)
+          gNavToolbox.setAttribute("flash-popup", "true");
+          compact.flashElement(gNavToolbox, NAMED_HOLD_MS, gNavToolbox.id);
+        } catch (err) {
+          noteError("naming: hold sidebar", err);
+        }
+      },
+      true
+    );
+  }
   // Optional: the last essential stretches across whatever's left of its row.
   // The grid can't span "to the end of the row" by itself, so Zia counts the
   // columns and sets the span.
@@ -20276,15 +20325,16 @@
   }
 
   // The colour Zen draws round the open essential's inner card (its icon's, blurred:
-  // Zen's "essentials favicon background") slowly moving about: it turns, drifts
-  // and swells on cycles of their own lengths, so the colours wander round the edge
-  // without repeating for minutes. Still under reduced motion. Set going by Zia
+  // Zen's "essentials favicon background") slowly moving about: it drifts and swells
+  // on cycles of their own lengths, so the colours wander round the edge without
+  // repeating for minutes. Still under reduced motion. (It turned as well, but the
+  // blurred colour is cut off at the top and bottom of its layer, and turning, those
+  // cut edges swept across the tile as two fine lines.) Set going by Zia
   // rather than in CSS, on the page's own clock: Zen draws the colour only while the
   // essential is chosen, and as a CSS animation it started again from the beginning
   // each time it came back (a glance on the essential closing, say), a jump. Set
   // going again each time, it comes back where it would be had it run all along.
   const ESSENTIAL_DRIFT = [
-    [[{ rotate: "0deg" }, { rotate: "360deg" }], { duration: 37000, direction: "normal" }],
     [
       [
         { translate: "-6% -4%", easing: "ease-in-out" },
@@ -21718,6 +21768,8 @@ function ziaGlow(container, { dark = true, cornerShape = "" } = {}) {
     safely("keepTabsHiddenAfterActiveLeaves", keepTabsHiddenAfterActiveLeaves);
     safely("openKeptFolderNames", openKeptFolderNames);
     safely("nameNewGroupsInPlace", nameNewGroupsInPlace);
+    safely("hintNameFields", hintNameFields);
+    safely("holdSidebarAfterNaming", holdSidebarAfterNaming);
     safely("allowEmojiFolderIcons", allowEmojiFolderIcons);
     safely("hideWwwInUrlbar", hideWwwInUrlbar);
     safely("watchRightEdges", watchRightEdges);
