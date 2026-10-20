@@ -1,7 +1,7 @@
   // The welcome tour (welcome/index.html): once on a first install, and once after
   // a release that bumps WELCOME_VERSION ("release + welcome card"), over a dimmed
   // window. Closed, it stays closed; settings can switch it off or show it again.
-  const WELCOME_VERSION = "2.95.9";
+  const WELCOME_VERSION = "2.102.0";
   const WELCOME_SEEN_PREF = "zia.welcome.seen";
   const WELCOME_UPDATES_PREF = "zia.welcome.show";
   const WELCOME_AGAIN_PREF = "zia.welcome.again";
@@ -18,7 +18,9 @@
     // which sit over anything else in the window
     overlay.setAttribute("popover", "manual");
     const frame = document.createElementNS(XHTML_NS, "iframe");
-    frame.setAttribute("src", `${WELCOME_URL}#${mode === "update" ? `update-${WELCOME_VERSION}` : mode}`);
+    // (with Ultra on, the page puts its wordmark in liquid metal)
+    const ultra = Services.prefs.getBoolPref("zia.ultra", true) ? "?ultra" : "";
+    frame.setAttribute("src", `${WELCOME_URL}${ultra}#${mode === "update" ? `update-${WELCOME_VERSION}` : mode}`);
     frame.setAttribute("title", "Welcome to Zia");
     overlay.append(frame);
 

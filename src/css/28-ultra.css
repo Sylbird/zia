@@ -1,0 +1,135 @@
+/* Ultra (zia.ultra, on by default): effects ported from Libraries.dev
+   (https://libraries.dev, MIT, by Jakub Antalik). zia.uc.js puts each in. */
+
+/* A loading tab's thinking orb, in its icon's place: the spinner goes while
+   it shows (28s-ultra.js) */
+.tab-icon-stack > canvas.zia-orb {
+  grid-area: 1 / 1;
+  place-self: center;
+  width: 16px;
+  height: 16px;
+  pointer-events: none;
+}
+
+.tabbrowser-tab[zia-orb] :is(.tab-throbber, .tab-icon-pending, .tab-icon-image) {
+  visibility: hidden !important;
+}
+
+/* The music player card's glow (28b-ultra-glow.css) under its text and buttons:
+   the card is its own stack (isolation), so the glow sits over its background
+   and under the rest */
+#zen-media-controls-toolbar .zen-media-card:has(> .zia-glow) {
+  position: relative;
+  --zia-glow-z: -1;
+}
+
+/* The glow takes the artwork's colours (28s-ultra.js), so the soft wash of them
+   behind the artwork on hover goes */
+#zen-media-controls-toolbar .zen-media-card::before {
+  @media -moz-pref("zia.ultra") {
+    display: none !important;
+  }
+}
+
+/* The address bar's loading line, as wide, as thick and moving as it always
+   does, in metal-fx's silver liquid metal (28s-ultra.js draws the metal along
+   it, 28x-ultra-metal-engine.js): the line itself a silver one, with the
+   moving metal laid over it and shown as far as the page has loaded, and the
+   glows round its head a cool white. Not with the loading line in the
+   space's own colour (an option). */
+@media -moz-pref("zia.ultra") {
+  @media not -moz-pref("zia.loading-bar.accent-color") {
+    :is(#urlbar:not([breakout-extend]), .zia-pane-address)::after {
+      --zia-load-line: linear-gradient(to right, rgba(170, 176, 190, 0.7), rgb(205, 210, 222) 70%, rgb(240, 242, 248) 100%);
+      --zia-load-tint: rgba(210, 222, 240, 0.22), rgba(170, 200, 240, 0.1) 50%, transparent 100%;
+      --zia-load-glow: rgba(230, 236, 250, 0.38), rgba(170, 200, 240, 0.15) 35%, rgba(200, 205, 220, 0.05) 70%, transparent 100%;
+    }
+
+    /* (on a light space, a mid grey, as silver vanishes on white; the metal,
+       in the preset's light tuning, darkens it where it reflects) */
+    :root[zia-light] :is(#urlbar:not([breakout-extend]), .zia-pane-address)::after {
+      --zia-load-line: linear-gradient(to right, rgba(130, 135, 148, 0.7), rgb(112, 117, 130) 70%, rgb(88, 93, 105) 100%);
+      --zia-load-tint: rgba(60, 66, 80, 0.14), rgba(60, 66, 80, 0.06) 50%, transparent 100%;
+      --zia-load-glow: rgba(50, 55, 68, 0.24), rgba(60, 66, 80, 0.1) 35%, rgba(60, 66, 80, 0.03) 70%, transparent 100%;
+    }
+
+    /* the metal: lightening the silver line where it shines, over it */
+    #urlbar > .zia-metal-line {
+      position: absolute;
+      inset: 0;
+      z-index: 1;
+      border-radius: var(--zia-urlbar-radius);
+      overflow: hidden;
+      pointer-events: none;
+      mix-blend-mode: screen;
+      opacity: 0;
+      transition: opacity 0.3s ease;
+
+      & > canvas {
+        position: absolute;
+        left: 0;
+        bottom: 0;
+        width: 100%;
+        height: 1.5px;
+        clip-path: inset(0 calc((1 - var(--zia-load-progress, 0)) * 100%) 0 0);
+      }
+    }
+
+    :root[zia-loading="true"] #urlbar:not([breakout-extend]) > .zia-metal-line {
+      opacity: 1;
+    }
+
+    :root[zia-light] #urlbar > .zia-metal-line {
+      mix-blend-mode: multiply;
+    }
+  }
+}
+
+/* The colour Zen draws round the open essential's inner card (its icon's,
+   blurred: Zen's "essentials favicon background") slowly moving about: it
+   turns, drifts and swells on cycles of their own lengths, so the colours
+   wander round the edge without repeating for minutes. Still under reduced
+   motion. */
+@media -moz-pref("zia.ultra") and -moz-pref("zen.theme.essentials-favicon-bg") {
+  @media (prefers-reduced-motion: no-preference) {
+    .tabbrowser-tab[zen-essential][visuallyselected] > .tab-stack > .tab-background::after {
+      animation:
+        zia-essential-turn 37s linear infinite,
+        zia-essential-drift 23s ease-in-out infinite alternate,
+        zia-essential-swell 17s ease-in-out infinite alternate !important;
+    }
+  }
+}
+
+@keyframes zia-essential-turn {
+  to { rotate: 360deg; }
+}
+
+@keyframes zia-essential-drift {
+  0% { translate: -6% -4%; }
+  30% { translate: 5% -2%; }
+  55% { translate: -2% 6%; }
+  80% { translate: 6% 3%; }
+  100% { translate: -4% 5%; }
+}
+
+@keyframes zia-essential-swell {
+  from { scale: 1.1; }
+  to { scale: 1.35; }
+}
+
+/* The Library's Media pictures dissolving in from a pixel mosaic
+   (28s-ultra.js, 28e-ultra-image.css): the mosaic over where the picture
+   goes, at its corners, the picture itself hidden till it's dissolved in */
+@media -moz-pref("zia.ultra") {
+  zen-library .zen-library-media-frame > .zia-media-load {
+    position: absolute;
+    inset: 0;
+    border-radius: 6px;
+    pointer-events: none;
+  }
+
+  zen-library .zen-library-media-thumb[zia-media-loading] {
+    opacity: 0 !important;
+  }
+}

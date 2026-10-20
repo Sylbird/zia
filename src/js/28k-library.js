@@ -93,6 +93,7 @@
     if (!box.height) {
       return;
     }
+    const moved = rail.hasAttribute("placed") && rail.style.transform !== `translateY(${top}px)`;
     rail.hidden = false;
     rail.toggleAttribute("instant", instantly);
     rail.style.height = `${box.height}px`;
@@ -100,6 +101,9 @@
     rail.setAttribute("placed", "true");
     if (instantly) {
       requestAnimationFrame(() => rail.removeAttribute("instant"));
+    } else if (moved && ultraOn()) {
+      // (with Ultra on, it stretches and squashes on the way, 28s-ultra.js)
+      ultraRailSquash(rail);
     }
   }
 
@@ -208,6 +212,8 @@
       sectionWatcher.observe(library, { childList: true, subtree: true, attributes: true, attributeFilter: ["open", "active"] });
       addButtons(library);
       safely("library: lift media", () => liftMediaUnderCursor(library));
+      // (with Ultra on, its pictures dissolve in from a pixel mosaic, 28s-ultra.js)
+      safely("library: media loader", () => ultraWatchMedia(library));
     };
     const toolbox = document.getElementById("navigator-toolbox");
     if (toolbox?.parentNode) {

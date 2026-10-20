@@ -6038,6 +6038,8 @@
     for (const feature of FEATURES) {
       set(`zia.features.${feature}`, true);
     }
+    // Ultra's effects, on unless switched off (the stylesheet reads it too)
+    set("zia.ultra", true);
     // Downloads a model the first time, so it's something to opt into
     set("zia.features.folder-icon-suggest", false);
 
@@ -10043,11 +10045,9 @@
     const tint = resolveColor(rootStyle.getPropertyValue("--zia-media-bg"));
     const base = resolveColor(rootStyle.getPropertyValue("--zia-media-card-base"));
     if (!paint || !tint || !base) {
-      root.style.removeProperty("--zia-media-rest");
       root.style.removeProperty("--zia-media-solid");
       return;
     }
-    root.style.setProperty("--zia-media-rest", cssColor(colorOver(tint, paint)));
     root.style.setProperty("--zia-media-solid", cssColor(colorOver(tint, colorOver(paint, base))));
   }
 
@@ -15739,7 +15739,7 @@
   // The welcome tour (welcome/index.html): once on a first install, and once after
   // a release that bumps WELCOME_VERSION ("release + welcome card"), over a dimmed
   // window. Closed, it stays closed; settings can switch it off or show it again.
-  const WELCOME_VERSION = "2.95.9";
+  const WELCOME_VERSION = "2.102.0";
   const WELCOME_SEEN_PREF = "zia.welcome.seen";
   const WELCOME_UPDATES_PREF = "zia.welcome.show";
   const WELCOME_AGAIN_PREF = "zia.welcome.again";
@@ -15756,7 +15756,9 @@
     // which sit over anything else in the window
     overlay.setAttribute("popover", "manual");
     const frame = document.createElementNS(XHTML_NS, "iframe");
-    frame.setAttribute("src", `${WELCOME_URL}#${mode === "update" ? `update-${WELCOME_VERSION}` : mode}`);
+    // (with Ultra on, the page puts its wordmark in liquid metal)
+    const ultra = Services.prefs.getBoolPref("zia.ultra", true) ? "?ultra" : "";
+    frame.setAttribute("src", `${WELCOME_URL}${ultra}#${mode === "update" ? `update-${WELCOME_VERSION}` : mode}`);
     frame.setAttribute("title", "Welcome to Zia");
     overlay.append(frame);
 
@@ -17261,6 +17263,7 @@
     if (!box.height) {
       return;
     }
+    const moved = rail.hasAttribute("placed") && rail.style.transform !== `translateY(${top}px)`;
     rail.hidden = false;
     rail.toggleAttribute("instant", instantly);
     rail.style.height = `${box.height}px`;
@@ -17268,6 +17271,9 @@
     rail.setAttribute("placed", "true");
     if (instantly) {
       requestAnimationFrame(() => rail.removeAttribute("instant"));
+    } else if (moved && ultraOn()) {
+      // (with Ultra on, it stretches and squashes on the way, 28s-ultra.js)
+      ultraRailSquash(rail);
     }
   }
 
@@ -17376,6 +17382,8 @@
       sectionWatcher.observe(library, { childList: true, subtree: true, attributes: true, attributeFilter: ["open", "active"] });
       addButtons(library);
       safely("library: lift media", () => liftMediaUnderCursor(library));
+      // (with Ultra on, its pictures dissolve in from a pixel mosaic, 28s-ultra.js)
+      safely("library: media loader", () => ultraWatchMedia(library));
     };
     const toolbox = document.getElementById("navigator-toolbox");
     if (toolbox?.parentNode) {
@@ -18420,6 +18428,5929 @@
     window.addEventListener("unload", () => observer.disconnect());
     document.querySelectorAll("screenshots-buttons").forEach(style);
   }
+  // ---------- Thinking orbs: a small dotted 3D orb on a 2D canvas
+  // A framework-free port of the canvas engine in thinking-orbs 0.3.2
+  // (https://libraries.dev/orbs), for the tab's loading spinner. The
+  // geometry, projection, presets and painter are the package's, line for
+  // line (the one change: a one-device-pixel floor on dots, which only
+  // matters under a device pixel ratio of 5/3; see ORB_MIN_DEVICE_R); the
+  // React component around them is replaced by ziaOrb() and one shared
+  // animation loop.
+  //
+  // thinking-orbs is MIT licensed:
+  //
+  //   MIT License
+  //
+  //   Copyright (c) 2026 Jakub Antalik
+  //
+  //   Permission is hereby granted, free of charge, to any person obtaining a
+  //   copy of this software and associated documentation files (the
+  //   "Software"), to deal in the Software without restriction, including
+  //   without limitation the rights to use, copy, modify, merge, publish,
+  //   distribute, sublicense, and/or sell copies of the Software, and to
+  //   permit persons to whom the Software is furnished to do so, subject to
+  //   the following conditions:
+  //
+  //   The above copyright notice and this permission notice shall be included
+  //   in all copies or substantial portions of the Software.
+  //
+  //   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+  //   OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+  //   MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+  //   IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+  //   CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+  //   TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+  //   SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+  //
+  // Use:
+  //   const orb = ziaOrb(document.createElementNS(XHTML_NS, "canvas"), { state: "searching", size: 16 });
+  //   box.append(orb.canvas);
+  //   orb.setState("connecting"); orb.setDark(false); orb.destroy();
+  //
+  // Options: state (one of ORB_STATES, default "working"); size in CSS px
+  // (default 64; 64, 32 and 20 are the package's tunings, sizes between
+  // are interpolated the way the package made its 32, and anything under
+  // 20 is the 20 tuning drawn at that size); dark (true: light dots for a
+  // dark background, false: dark dots for a light one, left out: follow
+  // prefers-color-scheme); and, as in the package, speed (a multiplier),
+  // color (an ink tint, "#rgb", "#rrggbb" or "rgb()") and label (the
+  // canvas's aria-label; it's left alone if the canvas is aria-hidden).
+  //
+  // A canvas that's out of the document when the loop next runs is dropped
+  // (destroy() isn't needed for it); setState() or setDark() on a handle
+  // whose canvas is back in the document picks it up again.
+
+  // ----- geometry helpers (engine/core)
+  function orbLerp(a, b, f) {
+    return a + (b - a) * f;
+  }
+
+  function orbFrac(x) {
+    return x - Math.floor(x);
+  }
+
+  // deterministic hash in [0, 1)
+  function orbHash(a, b) {
+    const h = Math.sin(a * 12.9898 + b * 78.233) * 43758.5453;
+    return h - Math.floor(h);
+  }
+
+  // value noise on a 2D lattice: smooth, deterministic, cheap
+  function orbNoise(x, y) {
+    const xi = Math.floor(x);
+    const yi = Math.floor(y);
+    let fx = x - xi;
+    let fy = y - yi;
+    fx = fx * fx * (3 - 2 * fx);
+    fy = fy * fy * (3 - 2 * fy);
+    const a = orbHash(xi, yi);
+    const b = orbHash(xi + 1, yi);
+    const c = orbHash(xi, yi + 1);
+    const d = orbHash(xi + 1, yi + 1);
+    return a + (b - a) * fx + (c - a) * fy + (a - b - c + d) * fx * fy;
+  }
+
+  // stable directions on a unit sphere (Fibonacci lattice)
+  function orbFibDir(i, n) {
+    const golden = Math.PI * (3 - Math.sqrt(5));
+    const y = 1 - (2 * (i + 0.5)) / n;
+    const rad = Math.sqrt(1 - y * y);
+    const a = i * golden;
+    return [rad * Math.cos(a), y, rad * Math.sin(a)];
+  }
+
+  // shortest signed angular distance, wrapped to (-pi, pi]
+  function orbAngleDelta(a, b) {
+    return Math.atan2(Math.sin(a - b), Math.cos(a - b));
+  }
+
+  // shared spin (yaw) + tilt + orthographic projection
+  function orbProjector(yaw, tilt, cx, cy, scale) {
+    const st = Math.sin(tilt);
+    const ct = Math.cos(tilt);
+    const sy = Math.sin(yaw);
+    const cyw = Math.cos(yaw);
+    return (x, y, z) => {
+      const x1 = x * cyw + z * sy;
+      const z1 = -x * sy + z * cyw;
+      const y1 = y * ct - z1 * st;
+      const z2 = y * st + z1 * ct;
+      return [cx + x1 * scale, cy - y1 * scale, z2];
+    };
+  }
+
+  // dot radii were tuned for a 300px frame; sub-linear scaling keeps small
+  // orbs legible
+  function orbRadiusScale(size, pow) {
+    return (size / 300) ** pow;
+  }
+
+  // drop invisible marks, clamp radii to the mode's floor, and z-sort
+  // far to near into draw order
+  function orbFinalize(dots, lines, rMin = 0.3) {
+    const visible = [];
+    for (const d of dots) {
+      if ((d.a ?? 1) < 0.02) {
+        continue;
+      }
+      d.r = Math.max(rMin, d.r);
+      visible.push(d);
+    }
+    visible.sort((a, b) => a.z - b.z);
+    return { dots: visible, lines: lines.filter((l) => (l.a ?? 1) >= 0.02) };
+  }
+
+  // ----- painter: matte grayscale dots; on a dark background the ink value
+  // is mirrored (1 - white) so near dots read bright
+  function orbInk(w, alpha, dark, tint) {
+    if (!tint) {
+      const g = Math.round((dark ? 1 - w : w) * 255);
+      return `rgba(${g},${g},${g},${alpha})`;
+    }
+    const ramp = (c) => Math.round(dark ? c * (1 - w) : c + (255 - c) * w);
+    return `rgba(${ramp(tint.r)},${ramp(tint.g)},${ramp(tint.b)},${alpha})`;
+  }
+
+  // lines first, so the nodes sit on top of their edges. (minR, in CSS px,
+  // is this port's: see ORB_MIN_DEVICE_R.)
+  function orbPaintFrame(ctx, frame, dark, tint, minR = 0) {
+    for (const l of frame.lines) {
+      const w = Math.min(1, Math.max(0, l.white));
+      ctx.strokeStyle = orbInk(w, l.a ?? 1, dark, tint);
+      ctx.lineWidth = l.w;
+      ctx.beginPath();
+      ctx.moveTo(l.x1, l.y1);
+      ctx.lineTo(l.x2, l.y2);
+      ctx.stroke();
+    }
+    for (const d of frame.dots) {
+      const w = Math.min(1, Math.max(0, d.white));
+      ctx.fillStyle = orbInk(w, d.a ?? 1, dark, tint);
+      ctx.beginPath();
+      ctx.arc(d.x, d.y, Math.max(d.r, minR), 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  // "#rgb", "#rrggbb" or "rgb()/rgba()" to {r, g, b}, else undefined
+  function orbParseTint(color) {
+    if (!color) {
+      return undefined;
+    }
+    const hex = String(color).trim().match(/^#([0-9a-f]{3}|[0-9a-f]{6})$/i);
+    if (hex) {
+      let h = hex[1];
+      if (h.length === 3) {
+        h = h.replace(/./g, (c) => c + c);
+      }
+      const n = parseInt(h, 16);
+      return { r: (n >> 16) & 255, g: (n >> 8) & 255, b: n & 255 };
+    }
+    const fn = String(color).trim().match(/^rgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)/i);
+    if (fn) {
+      return { r: Number(fn[1]), g: Number(fn[2]), b: Number(fn[3]) };
+    }
+    return undefined;
+  }
+
+  // ----- modes: pure geometry over (size, t, opts), one per state
+
+  // weaving: three strands plait around the sphere
+  function orbFrameBraid(size, t, o) {
+    const cx = size / 2;
+    const cy = size / 2;
+    const R = (size / 2) * 0.76;
+    const pt = orbProjector(t * 0.4, 0.3, cx, cy, 1);
+    const rs = orbRadiusScale(size, o.rsPow ?? 0.6);
+    const dots = [];
+    const ghostN = o.ghostN ?? 150;
+    for (let i = 0; i < ghostN; i++) {
+      const d = orbFibDir(i, ghostN);
+      const [px, py, z] = pt(d[0] * R, d[1] * R, d[2] * R);
+      const depth = (z / R + 1) / 2;
+      dots.push({ x: px, y: py, z, r: 0.8 * rs, white: 0.78, a: 0.1 + 0.22 * depth });
+    }
+    const strandN = o.strandN ?? 52;
+    const turns = o.turns ?? 3;
+    for (let s = 0; s < 3; s++) {
+      const phase = (s / 3) * 2 * Math.PI;
+      for (let i = 0; i < strandN; i++) {
+        const u = (orbFrac(i / strandN + t * 0.045) * 2 - 1) * 0.96;
+        const surf = Math.sqrt(Math.max(0, 1 - u * u));
+        const endFade = Math.min(1, (1 - Math.abs(u)) / 0.1);
+        const a = u * Math.PI * turns + phase;
+        const weave = 1 + 0.075 * Math.sin(u * Math.PI * turns * 2 + phase * 2 + t * 0.8);
+        const rr = surf * R * weave;
+        const [px, py, zr] = pt(Math.cos(a) * rr, u * R * weave, Math.sin(a) * rr);
+        const depth = (zr / R + 1) / 2;
+        dots.push({
+          x: px,
+          y: py,
+          z: zr,
+          r: ((o.rBase ?? 1.2) + (o.rDepth ?? 1.8) * depth) * rs,
+          white: 0.55 - 0.45 * depth,
+          a: endFade * (0.45 + 0.55 * depth),
+        });
+      }
+    }
+    return orbFinalize(dots, [], o.rMin);
+  }
+
+  // solving: the scramble-then-solve schedule and the quarter-turn moves
+  function orbSolveCycle(time, count, slotDur, rest) {
+    const cyc = 2 * count * slotDur + rest;
+    const tc = time % cyc;
+    const amount = new Array(count).fill(0);
+    let active = -1;
+    if (tc < 2 * count * slotDur) {
+      const slot = Math.floor(tc / slotDur);
+      const p = (tc - slot * slotDur) / slotDur;
+      const cl = Math.min(1, p / 0.7);
+      const ep = 1 - (1 - cl) ** 3;
+      if (slot < count) {
+        for (let i = 0; i < slot; i++) {
+          amount[i] = 1;
+        }
+        amount[slot] = ep;
+        active = slot;
+      } else {
+        const u = 2 * count - 1 - slot;
+        for (let i = 0; i < u; i++) {
+          amount[i] = 1;
+        }
+        amount[u] = 1 - ep;
+        active = u;
+      }
+    }
+    return { amount, active };
+  }
+
+  function orbApplyMoves(pt3, moves, sc) {
+    let [x, y, z] = pt3;
+    let inActive = false;
+    for (let i = 0; i < moves.length; i++) {
+      if (sc.amount[i] <= 0) {
+        continue;
+      }
+      const mv = moves[i];
+      const coord = mv.axis === 0 ? x : mv.axis === 1 ? y : z;
+      if (coord < mv.lo || coord >= mv.hi) {
+        continue;
+      }
+      if (i === sc.active) {
+        inActive = true;
+      }
+      const a = mv.ang * sc.amount[i];
+      const ca = Math.cos(a);
+      const sa = Math.sin(a);
+      if (mv.axis === 0) {
+        const y2 = y * ca - z * sa;
+        z = y * sa + z * ca;
+        y = y2;
+      } else if (mv.axis === 1) {
+        const x2 = x * ca + z * sa;
+        z = -x * sa + z * ca;
+        x = x2;
+      } else {
+        const x2 = x * ca - y * sa;
+        y = x * sa + y * ca;
+        x = x2;
+      }
+    }
+    return [x, y, z, inActive];
+  }
+
+  function orbMakeMoves(count) {
+    const moves = [];
+    for (let i = 0; i < count; i++) {
+      const axis = Math.min(2, Math.floor(orbHash(i, 2.3) * 3));
+      const lo = -1 + 0.5 * Math.min(3, Math.floor(orbHash(i, 5.9) * 4));
+      const dir = orbHash(i, 7.7) < 0.5 ? 1 : -1;
+      moves.push({ axis, lo, hi: lo + 0.5, ang: (dir * Math.PI) / 2 });
+    }
+    return moves;
+  }
+
+  // searching: a scan meridian sweeps a dotted globe
+  function orbFrameGlobe(size, t, o) {
+    const spin = 0.5;
+    const cx = size / 2;
+    const cy = size / 2;
+    const radius = (size / 2) * 0.82;
+    const tilt = 0.4 + 0.06 * Math.sin(t * 0.35);
+    const pt = orbProjector(t * spin, tilt, cx, cy, radius);
+    const scan = t * (spin + (1.7 - spin) * (o.scanMul ?? 1));
+    const rs = orbRadiusScale(size, o.rsPow ?? 0.6);
+    const dimBase = o.dimBase ?? 1;
+    const dots = [];
+    const latRings = o.latRings ?? 17;
+    const lonDensity = o.lonDensity ?? 44;
+    for (let li = 0; li <= latRings; li++) {
+      const lat = -Math.PI / 2 + (li / latRings) * Math.PI;
+      const cosLat = Math.cos(lat);
+      const sinLat = Math.sin(lat);
+      const lonCount = Math.max(1, Math.round(Math.abs(cosLat) * lonDensity));
+      for (let lj = 0; lj < lonCount; lj++) {
+        const lon = (lj / lonCount) * 2 * Math.PI;
+        const [px, py, z] = pt(cosLat * Math.cos(lon), sinLat, cosLat * Math.sin(lon));
+        const depth = (z + 1) / 2;
+        const d = orbAngleDelta(lon + t * spin, scan);
+        const boost = Math.exp(-(d * d) / 0.18) * Math.max(0, z);
+        dots.push({
+          x: px,
+          y: py,
+          z,
+          r: ((o.rBase ?? 0.6) + (o.rDepth ?? 1.7) * depth + (o.rBoost ?? 1) * boost) * rs,
+          white: (o.inkFar ?? 0.62) - (o.inkSpan ?? 0.54) * depth,
+          // (dimBase under 1 fades the un-scanned dots so the meridian reads)
+          a: dimBase + (1 - dimBase) * Math.min(1, boost),
+        });
+      }
+    }
+    return orbFinalize(dots, [], o.rMin);
+  }
+
+  // solving: bands scramble in quarter turns, then click back
+  function orbFrameRubik(size, t, o) {
+    const cx = size / 2;
+    const cy = size / 2;
+    const R = (size / 2) * 0.82;
+    const pt = orbProjector(t * 0.55, 0.35 + 0.1 * Math.sin(t * 0.9), cx, cy, R);
+    const rs = orbRadiusScale(size, o.rsPow ?? 0.6);
+    const moveCount = o.moveCount ?? 14;
+    const moves = orbMakeMoves(moveCount);
+    const sc = orbSolveCycle(t, moveCount, 0.42, 1.2);
+    const dots = [];
+    const latRings = o.latRings ?? 15;
+    const lonDensity = o.lonDensity ?? 40;
+    for (let li = 0; li <= latRings; li++) {
+      const lat = -Math.PI / 2 + (li / latRings) * Math.PI;
+      const cosLat = Math.cos(lat);
+      const sinLat = Math.sin(lat);
+      const lonCount = Math.max(1, Math.round(Math.abs(cosLat) * lonDensity));
+      for (let lj = 0; lj < lonCount; lj++) {
+        const lon = (lj / lonCount) * 2 * Math.PI;
+        const [x, y, z, inActive] = orbApplyMoves([cosLat * Math.cos(lon), sinLat, cosLat * Math.sin(lon)], moves, sc);
+        const [px, py, zr] = pt(x, y, z);
+        const depth = (zr + 1) / 2;
+        dots.push({
+          x: px,
+          y: py,
+          z: zr,
+          r: ((o.rBase ?? 0.6) + (o.rDepth ?? 1.7) * depth + (inActive ? (o.rActive ?? 0.3) : 0)) * rs,
+          white: (o.inkFar ?? 0.62) - (o.inkSpan ?? 0.54) * depth - (inActive ? 0.14 : 0),
+        });
+      }
+    }
+    return orbFinalize(dots, [], o.rMin);
+  }
+
+  // listening: a waveform rolls through latitude rings
+  function orbFrameWave(size, t, o) {
+    const cx = size / 2;
+    const cy = size / 2;
+    const R = (size / 2) * 0.874;
+    const pt = orbProjector(t * 0.18, 0.38, cx, cy, 1);
+    const rs = orbRadiusScale(size, o.rsPow ?? 0.6);
+    const dots = [];
+    const rings = o.rings ?? 15;
+    const lonDensity = o.lonDensity ?? 40;
+    for (let ri = 0; ri <= rings; ri++) {
+      const lat = -Math.PI / 2 + (ri / rings) * Math.PI;
+      const cosLat = Math.cos(lat);
+      const sinLat = Math.sin(lat);
+      const w = 0.62 * Math.sin(t * 2.1 - ri * 0.52) + 0.38 * Math.sin(t * 1.27 + ri * 0.83);
+      const rr = R * (0.88 + 0.105 * w);
+      const lonCount = Math.max(1, Math.round(Math.abs(cosLat) * lonDensity));
+      for (let lj = 0; lj < lonCount; lj++) {
+        const lon = (lj / lonCount) * 2 * Math.PI;
+        const [px, py, z] = pt(cosLat * Math.cos(lon) * rr, sinLat * rr, cosLat * Math.sin(lon) * rr);
+        const depth = (z / R + 1) / 2;
+        const crest = Math.max(0, w);
+        dots.push({
+          x: px,
+          y: py,
+          z,
+          r: ((o.rBase ?? 0.6) + (o.rDepth ?? 1.7) * depth) * (1 + 0.4 * crest) * rs,
+          white: 0.66 - 0.56 * depth - 0.1 * crest,
+        });
+      }
+    }
+    return orbFinalize(dots, [], o.rMin);
+  }
+
+  // shaping: a dotted outline morphs circle, triangle, square
+  function orbSmooth(x) {
+    return x * x * (3 - 2 * x);
+  }
+
+  function orbPolyPath(verts) {
+    const V = verts.length;
+    const L = [];
+    let total = 0;
+    for (let i = 0; i < V; i++) {
+      const a = verts[i];
+      const b = verts[(i + 1) % V];
+      const l = Math.hypot(b[0] - a[0], b[1] - a[1]);
+      L.push(l);
+      total += l;
+    }
+    return (f) => {
+      let target = f * total;
+      let i = 0;
+      while (target > L[i] && i < V - 1) {
+        target -= L[i];
+        i++;
+      }
+      const a = verts[i];
+      const b = verts[(i + 1) % V];
+      const ff = L[i] ? Math.min(1, target / L[i]) : 0;
+      return [a[0] + (b[0] - a[0]) * ff, a[1] + (b[1] - a[1]) * ff];
+    };
+  }
+
+  const ORB_SHAPES = [
+    (f) => {
+      const a = -Math.PI / 2 + f * 2 * Math.PI;
+      return [Math.cos(a) * 0.24, Math.sin(a) * 0.24];
+    },
+    orbPolyPath([
+      [0, -0.26],
+      [0.24, 0.16],
+      [-0.24, 0.16],
+    ]),
+    orbPolyPath([
+      [0, -0.2],
+      [0.2, -0.2],
+      [0.2, 0.2],
+      [-0.2, 0.2],
+      [-0.2, -0.2],
+    ]),
+  ];
+  const ORB_SHAPE_HOLD = 1.4;
+  const ORB_SHAPE_MORPH = 0.9;
+
+  function orbFrameMorph(size, t, o) {
+    const SEG = ORB_SHAPE_HOLD + ORB_SHAPE_MORPH;
+    const K = ORB_SHAPES.length;
+    const tc = t % (SEG * K);
+    const held = o.shape != null && o.shape >= 0 && o.shape < K ? Math.floor(o.shape) : -1;
+    const k = held >= 0 ? held : Math.floor(tc / SEG);
+    const local = held >= 0 ? t % SEG : tc - k * SEG;
+    const m = held >= 0 ? 0 : local > ORB_SHAPE_HOLD ? orbSmooth((local - ORB_SHAPE_HOLD) / ORB_SHAPE_MORPH) : 0;
+    const sprd = o.spread ?? 1;
+    const pA = ORB_SHAPES[k];
+    const pB = held >= 0 ? pA : ORB_SHAPES[(k + 1) % K];
+    const M = 160;
+    const pts = [];
+    for (let i = 0; i < M; i++) {
+      const f = i / M;
+      const a = pA(f);
+      const b = pB(f);
+      pts.push([(a[0] + (b[0] - a[0]) * m) * sprd, (a[1] + (b[1] - a[1]) * m) * sprd]);
+    }
+    const L = [];
+    let total = 0;
+    for (let i = 0; i < M; i++) {
+      const a = pts[i];
+      const b = pts[(i + 1) % M];
+      const l = Math.hypot(b[0] - a[0], b[1] - a[1]);
+      L.push(l);
+      total += l;
+    }
+    const n = Math.max(6, Math.round(34 * (o.iconD ?? 1)));
+    const re = (o.rDot ?? 0.021) * 1.35 * sprd;
+    const pulse = 1 + 0.02 * Math.sin(local * 3.1);
+    const dots = [];
+    const c2 = size / 2;
+    let seg = 0;
+    let acc = 0;
+    for (let k2 = 0; k2 < n; k2++) {
+      const target = (k2 / n) * total;
+      while (acc + L[seg] < target && seg < M - 1) {
+        acc += L[seg];
+        seg++;
+      }
+      const a = pts[seg];
+      const b = pts[(seg + 1) % M];
+      const f = L[seg] ? Math.min(1, (target - acc) / L[seg]) : 0;
+      const x = (a[0] + (b[0] - a[0]) * f) * pulse;
+      const y = (a[1] + (b[1] - a[1]) * f) * pulse;
+      dots.push({
+        x: c2 + x * size,
+        y: c2 + y * size,
+        z: 0,
+        r: Math.max(0.35, re * size),
+        white: 0.1,
+      });
+    }
+    return orbFinalize(dots, [], o.rMin);
+  }
+
+  // working: particles on tilted orbits
+  function orbFrameOrbits(size, t, o) {
+    const cx = size / 2;
+    const cy = size / 2;
+    const R = (size / 2) * 0.82;
+    const pt = orbProjector(t * 0.12, 0.3, cx, cy, 1);
+    const rs = orbRadiusScale(size, o.rsPow ?? 0.6);
+    const dots = [];
+    const orbitN = o.orbitN ?? 12;
+    const ghostN = o.ghostN ?? 40;
+    const particles = o.particles ?? 3;
+    for (let orb = 0; orb < orbitN; orb++) {
+      const h1 = orbHash(orb, 1.7);
+      const h2 = orbHash(orb, 5.2);
+      const h3 = orbHash(orb, 8.9);
+      const ro = R * (0.45 + 0.52 * h1);
+      const th = h1 * 2 * Math.PI;
+      const phi = Math.acos(2 * h2 - 1);
+      const nx = Math.sin(phi) * Math.cos(th);
+      const ny = Math.cos(phi);
+      const nz = Math.sin(phi) * Math.sin(th);
+      let ux = -ny;
+      let uy = nx;
+      const uz = 0;
+      const ul = Math.max(1e-6, Math.sqrt(ux * ux + uy * uy));
+      ux /= ul;
+      uy /= ul;
+      const vx = ny * uz - nz * uy;
+      const vy = nz * ux - nx * uz;
+      const vz = nx * uy - ny * ux;
+      const speed = (0.25 + 0.55 * h3) * (h3 > 0.5 ? 1 : -1);
+      for (let k = 0; k < ghostN; k++) {
+        const a = (k / ghostN) * 2 * Math.PI;
+        const [px, py, z] = pt(
+          (ux * Math.cos(a) + vx * Math.sin(a)) * ro,
+          (uy * Math.cos(a) + vy * Math.sin(a)) * ro,
+          (uz * Math.cos(a) + vz * Math.sin(a)) * ro,
+        );
+        const depth = (z / ro + 1) / 2;
+        dots.push({
+          x: px,
+          y: py,
+          z,
+          r: (o.ghostR ?? 0.9) * rs,
+          white: 0.72,
+          a: (o.ghostA ?? 0.5) * (0.4 + 0.6 * depth),
+        });
+      }
+      for (let m = 0; m < particles; m++) {
+        const a = t * speed + (m / particles) * 2 * Math.PI + h2 * 6;
+        const [px, py, z] = pt(
+          (ux * Math.cos(a) + vx * Math.sin(a)) * ro,
+          (uy * Math.cos(a) + vy * Math.sin(a)) * ro,
+          (uz * Math.cos(a) + vz * Math.sin(a)) * ro,
+        );
+        const depth = (z / ro + 1) / 2;
+        dots.push({
+          x: px,
+          y: py,
+          z,
+          r: ((o.partR ?? 1.2) + (o.partRDepth ?? 1.6) * depth) * rs,
+          white: 0.3 - 0.22 * depth,
+        });
+      }
+    }
+    return orbFinalize(dots, [], o.rMin);
+  }
+
+  // composing: an undulating multi-band sash; breathing (faceOn): the same
+  // sash turned face-on, undulating in its radius, with no ghost sphere
+  function orbFrameRibbon(size, t, o) {
+    const cx = size / 2;
+    const cy = size / 2;
+    const R = (size / 2) * 0.78;
+    const spin = o.spin ?? 1;
+    const camTilt = 0.3;
+    const pt = orbProjector(t * 0.1 * spin, camTilt, cx, cy, 1);
+    const rs = orbRadiusScale(size, o.rsPow ?? 0.6);
+    const dots = [];
+    const ghostN = o.ghostN ?? 150;
+    for (let i = 0; i < ghostN; i++) {
+      const d = orbFibDir(i, ghostN);
+      const [px, py, z] = pt(d[0] * R, d[1] * R, d[2] * R);
+      const depth = (z / R + 1) / 2;
+      dots.push({ x: px, y: py, z, r: 0.8 * rs, white: 0.78, a: 0.1 + 0.22 * depth });
+    }
+    const ya = t * 0.24 * spin;
+    const ta = o.faceOn ? -camTilt : 0.55 + 0.3 * Math.sin(t * 0.18) * spin;
+    const ux = Math.cos(ya);
+    const uy = 0;
+    const uz = Math.sin(ya);
+    const vx = -uz * Math.sin(ta);
+    const vy = Math.cos(ta);
+    const vz = ux * Math.sin(ta);
+    const nx = uy * vz - uz * vy;
+    const ny = uz * vx - ux * vz;
+    const nz = ux * vy - uy * vx;
+    const wobAmp = 0.23 * (o.wobMul ?? 1);
+    const baseR = o.faceOn ? R / (1 + 0.85 * wobAmp) : R;
+    const baseLanes = o.lanes ?? 5;
+    const segs = o.segs ?? 88;
+    const lanes = Math.max(1, Math.round(baseLanes * (o.bandMul ?? 1)));
+    for (let w = 0; w < lanes; w++) {
+      const laneOff = (w - (lanes - 1) / 2) * 0.075;
+      const edge = Math.abs(w - (lanes - 1) / 2) / Math.max(1, (lanes - 1) / 2);
+      for (let k = 0; k < segs; k++) {
+        const a = (k / segs) * 2 * Math.PI;
+        const wob = (0.16 * Math.sin(a * 3 - t * 1.7 + w * 0.22) + 0.07 * Math.sin(a * 5 + t * 1.1)) * (o.wobMul ?? 1);
+        const radial = o.faceOn ? 1 + wob : 1;
+        const off = o.faceOn ? laneOff : laneOff + wob;
+        const x = ux * Math.cos(a) + vx * Math.sin(a) + nx * off;
+        const y = uy * Math.cos(a) + vy * Math.sin(a) + ny * off;
+        const z = uz * Math.cos(a) + vz * Math.sin(a) + nz * off;
+        const l = Math.sqrt(x * x + y * y + z * z);
+        const rr = baseR * radial;
+        const [px, py, zr] = pt((x / l) * rr, (y / l) * rr, (z / l) * rr);
+        const depth = (zr / R + 1) / 2;
+        dots.push({
+          x: px,
+          y: py,
+          z: zr,
+          r: ((o.rBase ?? 1.1) + (o.rDepth ?? 1.7) * depth) * (1 - 0.25 * edge) * rs,
+          white: 0.52 - 0.44 * depth + 0.18 * edge,
+          a: 0.4 + 0.6 * depth,
+        });
+      }
+    }
+    return orbFinalize(dots, [], o.rMin);
+  }
+
+  // connecting: a constellation wires itself, packets running the edges
+  function orbFrameWeb(size, t, o) {
+    const cx = size / 2;
+    const cy = size / 2;
+    const R = (size / 2) * 0.8 * (o.spread ?? 1);
+    const pt = orbProjector(t * 0.12, 0.32, cx, cy, R);
+    const rs = orbRadiusScale(size, o.rsPow ?? 0.6);
+    const nodeN = o.nodeN ?? 30;
+    const thr = o.thr ?? 0.72;
+    const nodeR = o.nodeR ?? 1.4;
+    const nodeRDepth = o.nodeRDepth ?? 1.8;
+    const nodes = [];
+    for (let i = 0; i < nodeN; i++) {
+      const d = orbFibDir(i, nodeN);
+      const x = d[0] + 0.3 * (orbNoise(i * 0.31 + 9, t * 0.24) - 0.5) * 2;
+      const y = d[1] + 0.3 * (orbNoise(i * 0.53 + 27, t * 0.21) - 0.5) * 2;
+      const z = d[2] + 0.3 * (orbNoise(i * 0.77 + 55, t * 0.27) - 0.5) * 2;
+      const l = Math.sqrt(x * x + y * y + z * z);
+      nodes.push([x / l, y / l, z / l]);
+    }
+    const lines = [];
+    const dots = [];
+    for (let i = 0; i < nodeN; i++) {
+      for (let j = i + 1; j < nodeN; j++) {
+        const dx = nodes[i][0] - nodes[j][0];
+        const dy = nodes[i][1] - nodes[j][1];
+        const dz = nodes[i][2] - nodes[j][2];
+        const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        if (dist >= thr) {
+          continue;
+        }
+        const [x1, y1, z1] = pt(nodes[i][0], nodes[i][1], nodes[i][2]);
+        const [x2, y2, z2] = pt(nodes[j][0], nodes[j][1], nodes[j][2]);
+        const depth = ((z1 + z2) / 2 + 1) / 2;
+        lines.push({
+          x1,
+          y1,
+          x2,
+          y2,
+          white: 0.42,
+          a: (1 - dist / thr) * (0.3 + 0.55 * depth),
+          w: Math.max(0.6, (o.lineW ?? 0.8) * rs),
+        });
+      }
+    }
+    for (let i = 0; i < nodeN; i++) {
+      const [px, py, z] = pt(nodes[i][0], nodes[i][1], nodes[i][2]);
+      const depth = (z + 1) / 2;
+      const pulse = 1 + 0.25 * Math.sin(t * 1.4 + i * 2.7);
+      dots.push({
+        x: px,
+        y: py,
+        z,
+        r: (nodeR + nodeRDepth * depth) * pulse * rs,
+        white: 0.55 - 0.45 * depth,
+      });
+    }
+    const signals = o.signals ?? 5;
+    for (let s = 0; s < signals; s++) {
+      const seg = Math.floor(t * 0.55 + s * 7.31);
+      const a = Math.floor(orbHash(seg, s * 3.1 + 1.7) * nodeN);
+      const b = Math.floor(orbHash(seg, s * 5.7 + 4.2) * nodeN);
+      if (a === b) {
+        continue;
+      }
+      const f = orbFrac(t * 0.55 + s * 7.31);
+      const x = orbLerp(nodes[a][0], nodes[b][0], f);
+      const y = orbLerp(nodes[a][1], nodes[b][1], f);
+      const z = orbLerp(nodes[a][2], nodes[b][2], f);
+      const l = Math.max(1e-6, Math.sqrt(x * x + y * y + z * z));
+      const [px, py, zr] = pt(x / l, y / l, z / l);
+      const depth = (zr + 1) / 2;
+      dots.push({
+        x: px,
+        y: py,
+        z: zr,
+        r: (nodeR * 1.5 + nodeRDepth * depth) * rs,
+        white: 0.05,
+        a: 0.5 + 0.5 * depth,
+      });
+    }
+    return orbFinalize(dots, lines, o.rMin);
+  }
+
+  const ORB_FRAMES = {
+    orbits: orbFrameOrbits,
+    globe: orbFrameGlobe,
+    rubik: orbFrameRubik,
+    wave: orbFrameWave,
+    web: orbFrameWeb,
+    braid: orbFrameBraid,
+    ribbon: orbFrameRibbon,
+    // (ring is ribbon's geometry; its faceOn profile flag switches it)
+    ring: orbFrameRibbon,
+    morph: orbFrameMorph,
+  };
+
+  // ----- presets: state to mode, base profiles, and the tuned sizes
+  const ORB_STATE_MODE = {
+    working: "orbits",
+    searching: "globe",
+    solving: "rubik",
+    listening: "wave",
+    connecting: "web",
+    weaving: "braid",
+    composing: "ribbon",
+    breathing: "ring",
+    shaping: "morph",
+  };
+  const ORB_STATES = Object.keys(ORB_STATE_MODE);
+
+  const ORB_LABELS = {
+    working: "Working…",
+    searching: "Searching…",
+    solving: "Solving…",
+    listening: "Listening…",
+    connecting: "Connecting…",
+    weaving: "Weaving…",
+    composing: "Composing…",
+    breathing: "Thinking…",
+    shaping: "Shaping…",
+  };
+
+  const ORB_BASE_PROFILES = {
+    globe: { latRings: 17, lonDensity: 44, rBase: 0.6, rDepth: 1.7, rBoost: 1, inkFar: 0.62, inkSpan: 0.54, rsPow: 0.6, rMin: 0.3 },
+    orbits: { orbitN: 12, ghostN: 40, ghostR: 0.9, ghostA: 0.5, particles: 3, partR: 1.2, partRDepth: 1.6, rsPow: 0.6, rMin: 0.3 },
+    rubik: { latRings: 15, lonDensity: 40, moveCount: 14, rBase: 0.6, rDepth: 1.7, rActive: 0.3, inkFar: 0.62, inkSpan: 0.54, rsPow: 0.6, rMin: 0.3 },
+    wave: { rings: 15, lonDensity: 40, rBase: 0.6, rDepth: 1.7, rsPow: 0.6, rMin: 0.3 },
+    web: { nodeN: 30, thr: 0.72, signals: 5, nodeR: 1.4, nodeRDepth: 1.8, lineW: 0.8, rsPow: 0.6, rMin: 0.3 },
+    braid: { strandN: 52, turns: 3, ghostN: 150, rBase: 1.2, rDepth: 1.8, rsPow: 0.6, rMin: 0.3 },
+    ribbon: { lanes: 5, segs: 88, ghostN: 150, rBase: 1.1, rDepth: 1.7, rsPow: 0.6, rMin: 0.3 },
+    ring: { lanes: 5, segs: 88, ghostN: 0, faceOn: 1, rBase: 1.1, rDepth: 1.7, rsPow: 0.6, rMin: 0.3 },
+    morph: { rDot: 0.021, iconD: 1, rMin: 0.25 },
+  };
+
+  // per mode and size: speed, a dot-count multiplier, a dot-size multiplier
+  // and extra opts. 64 and 20 are hand-tuned; 32 is interpolated from them
+  // in log space (orbPreset does the same for other sizes between).
+  const ORB_PRESETS = {
+    orbits: {
+      64: { speed: 1.885, count: 1, size: 1 },
+      32: { speed: 2.9072, count: 0.4251, size: 1.6849 },
+      20: { speed: 3.9, count: 0.238, size: 2.4 },
+    },
+    globe: {
+      64: { speed: 2.015, count: 0.42, size: 1.15, extra: { scanMul: 4.08, dimBase: 0.45 } },
+      32: { speed: 2.3803, count: 0.1839, size: 1.4769, extra: { scanMul: 4.2301, dimBase: 0.45 } },
+      20: { speed: 2.665, count: 0.105, size: 1.75, extra: { scanMul: 4.335, dimBase: 0.45 } },
+    },
+    rubik: {
+      64: { speed: 1.82, count: 0.35, size: 1.05 },
+      32: { speed: 1.8964, count: 0.1537, size: 1.4951 },
+      20: { speed: 1.95, count: 0.088, size: 1.9 },
+    },
+    wave: {
+      64: { speed: 4.388, count: 0.341, size: 1 },
+      32: { speed: 4.1512, count: 0.169, size: 1.3232 },
+      20: { speed: 3.998, count: 0.105, size: 1.6 },
+    },
+    web: {
+      64: { speed: 3.315, count: 1.35, size: 0.95 },
+      32: { speed: 5.0104, count: 0.4942, size: 1.2571 },
+      20: { speed: 6.63, count: 0.25, size: 1.52 },
+    },
+    braid: {
+      64: { speed: 1.625, count: 0.5, size: 1 },
+      32: { speed: 2.2234, count: 0.2056, size: 1.2011 },
+      20: { speed: 2.75, count: 0.1125, size: 1.36 },
+    },
+    ribbon: {
+      64: { speed: 2.34, count: 0.25, size: 0.85, extra: { spin: 0, bandMul: 3.9, wobMul: 1 } },
+      32: { speed: 2.7776, count: 0.0969, size: 0.9766, extra: { spin: 0, bandMul: 4.49, wobMul: 1 } },
+      20: { speed: 3.12, count: 0.051, size: 1.073, extra: { spin: 0, bandMul: 4.94, wobMul: 1 } },
+    },
+    ring: {
+      64: { speed: 3.24, count: 0.25, size: 0.956, extra: { spin: 0, bandMul: 3.627, wobMul: 0.368 } },
+      32: { speed: 3.5517, count: 0.0678, size: 1.31, extra: { spin: 0, bandMul: 3.8265, wobMul: 0.4751 } },
+      20: { speed: 3.78, count: 0.028, size: 1.622, extra: { spin: 0, bandMul: 3.968, wobMul: 0.565 } },
+    },
+    morph: {
+      64: { speed: 2.405, count: 0.702, size: 0.395, extra: { spread: 1.45 } },
+      32: { speed: 2.2057, count: 0.5937, size: 0.6916, extra: { spread: 1.45 } },
+      20: { speed: 2.08, count: 0.53, size: 1.011, extra: { spread: 1.45 } },
+    },
+  };
+
+  const ORB_COUNT_PAIRS = [
+    ["latRings", "lonDensity"],
+    ["rings", "lonDensity"],
+    ["lanes", "segs"],
+  ];
+  const ORB_COUNT_KEYS = ["orbitN", "ghostN", "nodeN", "strandN", "signals"];
+  const ORB_RADIUS_KEYS = ["rBase", "rDepth", "rActive", "rDot", "ghostR", "partR", "partRDepth", "nodeR", "nodeRDepth"];
+
+  // grid pairs scale by the square root so their product tracks the scale
+  function orbScaleCounts(opts, scale) {
+    const out = { ...opts };
+    const done = new Set();
+    const rt = Math.sqrt(scale);
+    for (const [a, b] of ORB_COUNT_PAIRS) {
+      if (out[a] != null && out[b] != null && !done.has(a) && !done.has(b)) {
+        out[a] = Math.max(2, Math.round(out[a] * rt));
+        out[b] = Math.max(2, Math.round(out[b] * rt));
+        done.add(a);
+        done.add(b);
+      }
+    }
+    for (const k of ORB_COUNT_KEYS) {
+      const v = out[k];
+      if (v != null && v !== 0 && !done.has(k)) {
+        out[k] = Math.max(1, Math.round(v * scale));
+      }
+    }
+    if (out.iconD != null) {
+      out.iconD = Math.max(0.02, out.iconD * scale);
+    }
+    return out;
+  }
+
+  function orbScaleRadii(opts, scale) {
+    const out = { ...opts };
+    for (const k of ORB_RADIUS_KEYS) {
+      if (out[k] != null) {
+        out[k] *= scale;
+      }
+    }
+    out.rSizeMul = (out.rSizeMul ?? 1) * scale;
+    return out;
+  }
+
+  // the tuned preset for a size: 64, 32 and 20 as shipped, others between
+  // 20 and 64 interpolated in log space as the package made its 32 (those
+  // knobs are ratios), 20's tuning below 20 and 64's above 64
+  function orbPreset(mode, size) {
+    const table = ORB_PRESETS[mode];
+    if (table[size]) {
+      return table[size];
+    }
+    if (size <= 20) {
+      return table[20];
+    }
+    if (size >= 64) {
+      return table[64];
+    }
+    const f = Math.log(size / 64) / Math.log(20 / 64);
+    const mix = (a, b) => (a > 0 && b > 0 ? Math.exp(Math.log(a) + (Math.log(b) - Math.log(a)) * f) : a + (b - a) * f);
+    const big = table[64];
+    const small = table[20];
+    const preset = { speed: mix(big.speed, small.speed), count: mix(big.count, small.count), size: mix(big.size, small.size) };
+    if (big.extra) {
+      preset.extra = {};
+      for (const key of Object.keys(big.extra)) {
+        preset.extra[key] = mix(big.extra[key], small.extra[key]);
+      }
+    }
+    return preset;
+  }
+
+  const orbResolvedCache = new Map();
+
+  // a (state, size) pair to its mode, speed and fully scaled draw options
+  function orbResolve(state, size) {
+    const key = `${state}-${size}`;
+    const hit = orbResolvedCache.get(key);
+    if (hit) {
+      return hit;
+    }
+    const mode = ORB_STATE_MODE[state];
+    const preset = orbPreset(mode, size);
+    let opts = { ...ORB_BASE_PROFILES[mode] };
+    if (preset.count !== 1) {
+      opts = orbScaleCounts(opts, preset.count);
+    }
+    if (preset.size !== 1) {
+      opts = orbScaleRadii(opts, preset.size);
+    }
+    if (preset.extra) {
+      opts = { ...opts, ...preset.extra };
+    }
+    const resolved = { mode, speed: preset.speed, opts };
+    orbResolvedCache.set(key, resolved);
+    return resolved;
+  }
+
+  // ----- the orbs on screen, and the one loop that draws them
+  const ORB_XHTML = "http://www.w3.org/1999/xhtml";
+  // (the frame the package shows under prefers-reduced-motion)
+  const ORB_STILL_T = 0.6;
+  // The one change to the package's look: no dot is drawn smaller than one
+  // device pixel across. The package floors dots at 0.3 CSS px, which on a
+  // 1x screen is a 0.6px smudge, so at 16 and 20 px the globe-like states
+  // (searching, listening, weaving, composing) went faint. At a device
+  // pixel ratio of 5/3 or more this floor is under the package's and changes
+  // nothing. Set it to 0 for the package's dots everywhere.
+  const ORB_MIN_DEVICE_R = 0.5;
+  const orbLive = new Set();
+  const orbByCanvas = new WeakMap();
+  let orbLoop = 0;
+  let orbHooked = false;
+  let orbReduceQuery = null;
+  let orbDarkQuery = null;
+  let orbSeen = null;
+
+  function orbStill() {
+    return !!orbReduceQuery?.matches;
+  }
+
+  // (as in the package: dark when there's no media query to ask)
+  function orbSystemDark() {
+    return orbDarkQuery ? orbDarkQuery.matches : true;
+  }
+
+  // device pixel ratio, capped at 2 as in the package
+  function orbDpr() {
+    return Math.min(2, window.devicePixelRatio || 1);
+  }
+
+  // listeners shared by every orb, set up with the first
+  function orbHook() {
+    if (orbHooked) {
+      return;
+    }
+    orbHooked = true;
+    if (typeof matchMedia === "function") {
+      orbReduceQuery = matchMedia("(prefers-reduced-motion: reduce)");
+      orbDarkQuery = matchMedia("(prefers-color-scheme: dark)");
+      orbReduceQuery.addEventListener("change", orbRedrawAll);
+      orbDarkQuery.addEventListener("change", orbRedrawAll);
+      orbWatchDpr();
+    }
+    document.addEventListener("visibilitychange", orbWake);
+    // (orbs scrolled or folded out of view rest, as in the package)
+    if (typeof IntersectionObserver === "function") {
+      orbSeen = new IntersectionObserver((entries) => {
+        for (const entry of entries) {
+          const orb = orbByCanvas.get(entry.target);
+          if (orb) {
+            orb.visible = entry.isIntersecting;
+          }
+        }
+        orbWake();
+      });
+    }
+  }
+
+  // redraw at the new sharpness when the window moves to another screen or
+  // is zoomed (the loop would catch it, but not for a still orb)
+  function orbWatchDpr() {
+    const query = matchMedia(`(resolution: ${window.devicePixelRatio || 1}dppx)`);
+    query.addEventListener(
+      "change",
+      () => {
+        orbWatchDpr();
+        orbRedrawAll();
+      },
+      { once: true },
+    );
+  }
+
+  function orbRedrawAll() {
+    const now = performance.now();
+    for (const orb of orbLive) {
+      if (orb.canvas.isConnected) {
+        orbDraw(orb, now);
+      } else {
+        orbDrop(orb);
+      }
+    }
+    orbWake();
+  }
+
+  // start the loop if something on screen needs it
+  function orbWake() {
+    if (orbLoop || document.hidden || orbStill()) {
+      return;
+    }
+    for (const orb of orbLive) {
+      if (orb.visible || !orb.canvas.isConnected) {
+        orbLoop = requestAnimationFrame(orbTick);
+        return;
+      }
+    }
+  }
+
+  function orbTick(now) {
+    orbLoop = 0;
+    if (document.hidden || orbStill()) {
+      return;
+    }
+    // (orbs in the same state and size share one frame, and with the same
+    // ink a painted copy of it)
+    const frames = new Map();
+    const copies = new Map();
+    let drawing = false;
+    for (const orb of orbLive) {
+      if (!orb.canvas.isConnected) {
+        orbDrop(orb);
+        continue;
+      }
+      if (!orb.visible) {
+        continue;
+      }
+      drawing = true;
+      orbDraw(orb, now, frames, copies);
+    }
+    if (drawing) {
+      orbLoop = requestAnimationFrame(orbTick);
+    }
+  }
+
+  // one frame onto the orb's canvas: the package's shared clock (seconds
+  // times the preset's speed), or its still frame under reduced motion
+  function orbDraw(orb, now, frames, copies) {
+    const { canvas, ctx } = orb;
+    if (!ctx) {
+      return;
+    }
+    const dpr = orbDpr();
+    if (orb.dpr !== dpr) {
+      orb.dpr = dpr;
+      canvas.width = Math.round(orb.size * dpr);
+      canvas.height = Math.round(orb.size * dpr);
+    }
+    const dark = orb.dark ?? orbSystemDark();
+    const shape = `${orb.state}|${orb.size}|${orb.speed}`;
+    const look = `${shape}|${dark}|${orb.tintKey}|${dpr}`;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    const twin = copies?.get(look);
+    if (twin) {
+      ctx.drawImage(twin, 0, 0);
+      return;
+    }
+    let frame = frames?.get(shape);
+    if (!frame) {
+      const t = orbStill() ? ORB_STILL_T : (now / 1000) * orb.speed;
+      frame = ORB_FRAMES[orb.mode](orb.size, t, orb.opts);
+      frames?.set(shape, frame);
+    }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    orbPaintFrame(ctx, frame, dark, orb.tint, ORB_MIN_DEVICE_R / dpr);
+    copies?.set(look, canvas);
+  }
+
+  function orbDrop(orb) {
+    orbLive.delete(orb);
+    orbSeen?.unobserve(orb.canvas);
+    orb.live = false;
+    orb.dropped = true;
+  }
+
+  // (re)join the loop and draw now, as the package does on every change
+  function orbShow(orb) {
+    if (orb.gone) {
+      return;
+    }
+    if (!orb.live) {
+      if (orb.dropped && !orb.canvas.isConnected) {
+        // (dropped, and still out of the document)
+        return;
+      }
+      orb.live = true;
+      orb.visible = true;
+      orbLive.add(orb);
+      orbSeen?.observe(orb.canvas);
+    }
+    orbDraw(orb, performance.now());
+    orbWake();
+  }
+
+  function orbApplyState(orb, state) {
+    const resolved = orbResolve(state, orb.size);
+    orb.state = state;
+    orb.mode = resolved.mode;
+    orb.opts = resolved.opts;
+    orb.speed = resolved.speed * orb.pace;
+    if (orb.canvas.getAttribute("aria-hidden") !== "true") {
+      orb.canvas.setAttribute("role", "img");
+      orb.canvas.setAttribute("aria-label", orb.label || ORB_LABELS[state]);
+    }
+  }
+
+  // ziaOrb(canvas, { state, size, dark, speed, color, label })
+  //   -> { canvas, setState(name), setDark(bool or null), destroy() }
+  function ziaOrb(canvas, options = {}) {
+    canvas ||= document.createElementNS(ORB_XHTML, "canvas");
+    orbHook();
+    orbByCanvas.get(canvas)?.handle.destroy();
+    const size = Number(options.size) > 0 ? Number(options.size) : 64;
+    const orb = {
+      canvas,
+      ctx: canvas.getContext("2d"),
+      size,
+      dark: typeof options.dark === "boolean" ? options.dark : null,
+      pace: Number(options.speed) > 0 ? Number(options.speed) : 1,
+      tint: orbParseTint(options.color),
+      tintKey: options.color ? String(options.color) : "",
+      label: options.label || "",
+      dpr: 0,
+      visible: true,
+      live: false,
+      dropped: false,
+      gone: false,
+    };
+    orbApplyState(orb, ORB_STATE_MODE[options.state] ? options.state : "working");
+    canvas.style.width = `${size}px`;
+    canvas.style.height = `${size}px`;
+    canvas.style.display = "block";
+    orb.handle = {
+      canvas,
+      setState(name) {
+        if (!ORB_STATE_MODE[name]) {
+          return;
+        }
+        if (name !== orb.state) {
+          orbApplyState(orb, name);
+        }
+        orbShow(orb);
+      },
+      // (true: light dots for a dark background, false: dark dots for a
+      // light one, null: follow prefers-color-scheme)
+      setDark(value) {
+        orb.dark = typeof value === "boolean" ? value : null;
+        orbShow(orb);
+      },
+      destroy() {
+        orb.gone = true;
+        orbDrop(orb);
+        if (orbByCanvas.get(canvas) === orb) {
+          orbByCanvas.delete(canvas);
+        }
+      },
+    };
+    orbByCanvas.set(canvas, orb);
+    orbShow(orb);
+    return orb.handle;
+  }
+  // ---------- Ultra (zia.ultra, on by default)
+  // Effects ported from Libraries.dev (https://libraries.dev, MIT, by Jakub
+  // Antalik), each where its author places it: a thinking orb for loading, a
+  // glow under what's playing, the Library's chosen section springing to the
+  // next, liquid metal along the loading line, and the Library's pictures
+  // dissolving in from a pixel mosaic (the colour round the open essential
+  // drifting is 28-ultra.css).
+  const ULTRA_PREF = "zia.ultra";
+  const ultraOn = () => Services.prefs.getBoolPref(ULTRA_PREF, true);
+
+  // A loading tab's spinner as a thinking orb (28r-ultra-orb-engine.js):
+  // "connecting" until the page starts arriving, then "searching", the dotted
+  // globe. Only once it's been loading a moment, as the orbs' author advises:
+  // a quick load keeps its icon rather than flashing an orb.
+  function watchUltraOrbs() {
+    const orbs = new Map();
+    const dark = () => !root.hasAttribute("zia-light");
+    const stateFor = (tab) => (tab.hasAttribute("progress") ? "searching" : "connecting");
+
+    const drop = (tab) => {
+      const entry = orbs.get(tab);
+      if (!entry) {
+        return;
+      }
+      clearTimeout(entry.timer);
+      entry.orb?.destroy();
+      entry.orb?.canvas.remove();
+      tab.removeAttribute("zia-orb");
+      orbs.delete(tab);
+    };
+
+    const show = (tab, entry) => {
+      const stack = tab.querySelector(".tab-icon-stack");
+      if (!ultraOn() || !tab.isConnected || !tab.hasAttribute("busy") || !stack) {
+        drop(tab);
+        return;
+      }
+      const canvas = document.createElementNS(XHTML_NS, "canvas");
+      canvas.className = "zia-orb";
+      // (the tab's own name says what's loading)
+      canvas.setAttribute("aria-hidden", "true");
+      stack.append(canvas);
+      entry.orb = ziaOrb(canvas, { state: stateFor(tab), size: 16, dark: dark() });
+      tab.setAttribute("zia-orb", "true");
+    };
+
+    const sync = (tab) => {
+      if (!ultraOn() || !tab.isConnected || !tab.hasAttribute("busy")) {
+        drop(tab);
+        return;
+      }
+      const entry = orbs.get(tab);
+      if (entry) {
+        entry.orb?.setState(stateFor(tab));
+        return;
+      }
+      const waiting = { orb: null, timer: 0 };
+      waiting.timer = setTimeout(() => show(tab, waiting), 300);
+      orbs.set(tab, waiting);
+    };
+
+    const syncAll = () => {
+      for (const tab of new Set([...gBrowser.tabs, ...orbs.keys()])) {
+        sync(tab);
+      }
+    };
+
+    gBrowser.tabContainer.addEventListener("TabAttrModified", (event) => {
+      const changed = event.detail?.changed || [];
+      if (changed.includes("busy") || changed.includes("progress")) {
+        sync(event.target);
+      }
+    });
+    gBrowser.tabContainer.addEventListener("TabClose", (event) => drop(event.target));
+    watchPrefs(ULTRA_PREF, syncAll);
+    new MutationObserver(() => {
+      for (const entry of orbs.values()) {
+        entry.orb?.setDark(dark());
+      }
+    }).observe(root, { attributes: true, attributeFilter: ["zia-light"] });
+    syncAll();
+  }
+
+  // A few of a picture's colours for the music player's glow, most present
+  // first and as bright as a glow wants them; null for a grey picture (the glow
+  // keeps its own colours)
+  const ultraArtPalettes = new Map();
+
+  async function readArtPalette(url) {
+    const data = await readPixels(url, 32);
+    if (!data) {
+      return null;
+    }
+    const bins = Array.from({ length: 12 }, (_, hue) => ({ hue, n: 0, r: 0, g: 0, b: 0 }));
+    let seen = 0;
+    for (let i = 0; i < data.length; i += 4) {
+      const [r, g, b, a] = [data[i], data[i + 1], data[i + 2], data[i + 3]];
+      if (a < 128) {
+        continue;
+      }
+      seen++;
+      const max = Math.max(r, g, b);
+      const min = Math.min(r, g, b);
+      const sat = max ? (max - min) / max : 0;
+      if (sat < 0.25 || max < 50) {
+        continue;
+      }
+      const bin = bins[Math.floor(rgbToHsl(r, g, b)[0] * 12) % 12];
+      bin.n += sat;
+      bin.r += r * sat;
+      bin.g += g * sat;
+      bin.b += b * sat;
+    }
+    // the strongest hues, none next to one already taken (one colour, not two shades of it)
+    const picked = [];
+    for (const bin of bins.filter((b) => b.n > seen * 0.012).sort((x, y) => y.n - x.n)) {
+      if (picked.length < 4 && picked.every((p) => Math.min((p.hue - bin.hue + 12) % 12, (bin.hue - p.hue + 12) % 12) > 1)) {
+        picked.push(bin);
+      }
+    }
+    if (!picked.length) {
+      return null;
+    }
+    const glowy = ([h, s, l]) => [h, Math.max(0.7, s), Math.min(0.62, Math.max(0.52, l))];
+    const colors = picked.map((bin) => glowy(rgbToHsl(bin.r / bin.n, bin.g / bin.n, bin.b / bin.n)));
+    // one colour alone: it and a shade either side of it, so the glow still shifts
+    if (colors.length === 1) {
+      const [h, s, l] = colors[0];
+      colors.push([(h + 0.07) % 1, s, l], [(h + 0.93) % 1, s, l]);
+    }
+    return colors.map(([h, s, l]) => `rgb(${hslToRgb(h, s, l).join(", ")})`);
+  }
+
+  function rgbToHsl(r, g, b) {
+    r /= 255;
+    g /= 255;
+    b /= 255;
+    const max = Math.max(r, g, b);
+    const min = Math.min(r, g, b);
+    const l = (max + min) / 2;
+    if (max === min) {
+      return [0, 0, l];
+    }
+    const d = max - min;
+    const s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+    const h = max === r ? (g - b) / d + (g < b ? 6 : 0) : max === g ? (b - r) / d + 2 : (r - g) / d + 4;
+    return [h / 6, s, l];
+  }
+
+  function hslToRgb(h, s, l) {
+    const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+    const p = 2 * l - q;
+    const channel = (t) => {
+      t = (t + 1) % 1;
+      const v = t < 1 / 6 ? p + (q - p) * 6 * t : t < 1 / 2 ? q : t < 2 / 3 ? p + (q - p) * (2 / 3 - t) * 6 : p;
+      return Math.round(v * 255);
+    };
+    return [channel(h + 1 / 3), channel(h), channel(h - 1 / 3)];
+  }
+
+  // The music player card glows along its bottom edge as voice-glow's beam does
+  // under a voice (28t-ultra-glow-engine.js), in the colours of what's playing:
+  // while you point at it and it plays. The browser can't hear the tab, so it
+  // follows a gentle, music-like level, and sinks and fades out when paused or
+  // left. Under the card's text and buttons.
+  function watchUltraGlow() {
+    const glows = new Map();
+    const dark = () => !root.hasAttribute("zia-light");
+    const cards = () => document.querySelectorAll("#zen-media-controls-toolbar .zen-media-card");
+
+    const tint = async (card, glow) => {
+      const url = artUrlOf(card);
+      if (card.__ziaGlowArt === url) {
+        return;
+      }
+      card.__ziaGlowArt = url;
+      if (!ultraArtPalettes.has(url)) {
+        ultraArtPalettes.set(url, url ? await readArtPalette(url) : null);
+      }
+      if (card.__ziaGlowArt === url && glows.get(card) === glow) {
+        glow.setColors(ultraArtPalettes.get(url));
+      }
+    };
+
+    const sync = () => {
+      const on = ultraOn();
+      const seen = new Set();
+      for (const card of on ? cards() : []) {
+        seen.add(card);
+        let glow = glows.get(card);
+        if (!glow) {
+          // (the card's squircle, as Zia sets it: it's what the glow is cut to)
+          const cornerShape = getComputedStyle(card).getPropertyValue("--zia-squircle").trim();
+          glow = ziaGlow(card, { dark: dark(), cornerShape });
+          glows.set(card, glow);
+          card.__ziaGlowArt = undefined;
+        }
+        tint(card, glow).catch((err) => noteError("ultra: glow colours", err));
+        glow.setPlaying(card.classList.contains("playing") && card.matches(":hover"));
+      }
+      for (const [card, glow] of glows) {
+        if (!seen.has(card)) {
+          glow.destroy();
+          glows.delete(card);
+        }
+      }
+    };
+
+    const toolbar = document.getElementById("zen-media-controls-toolbar");
+    if (toolbar) {
+      new MutationObserver(sync).observe(toolbar, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ["class", "zia-art", "zia-favicon"],
+      });
+      // (a frame on, once the pointer's left the card for whatever it's now over)
+      let pending = 0;
+      const later = () => {
+        pending ||= requestAnimationFrame(() => {
+          pending = 0;
+          sync();
+        });
+      };
+      toolbar.addEventListener("mouseover", later);
+      toolbar.addEventListener("mouseout", later);
+    }
+    new MutationObserver(() => {
+      for (const glow of glows.values()) {
+        glow.setDark(dark());
+      }
+    }).observe(root, { attributes: true, attributeFilter: ["zia-light"] });
+    watchPrefs(ULTRA_PREF, sync);
+    sync();
+  }
+
+  // The Library's chosen-section tile (28k-library.js), as it springs to the
+  // section you pick (its own slide, on Zia's spring), stretches as it goes
+  // and squashes as it lands, as liquid-gooey's "move" does, glass edge and
+  // all. Nothing under reduced motion.
+  function ultraRailSquash(rail) {
+    if (matchMedia("(prefers-reduced-motion: reduce)").matches || typeof rail.animate !== "function") {
+      return;
+    }
+    rail.ziaSquash?.cancel();
+    rail.ziaSquash = rail.animate(
+      [
+        { scale: "1 1" },
+        { scale: "0.88 1.16", offset: 0.3 },
+        { scale: "1.06 0.93", offset: 0.62 },
+        { scale: "0.98 1.02", offset: 0.82 },
+        { scale: "1 1" },
+      ],
+      { duration: 520, easing: "ease-out" }
+    );
+  }
+
+  // The pictures in the Library's Media (Zen loads each as its tile comes into
+  // view): img-fx's pixel mosaic churns where the picture will be, takes the
+  // picture's own shape once it's loaded, and dissolves into it
+  // (28y-ultra-image-engine.js). Videos and file icons as they were.
+  // 28k-library.js hands each Library over as it's made.
+  function ultraWatchMedia(library) {
+    const THUMB = "img.zen-library-media-thumb:not(.zen-library-media-file)";
+    const live = new Map();
+
+    const finish = (img) => {
+      const entry = live.get(img);
+      if (!entry) {
+        return;
+      }
+      live.delete(img);
+      entry.fx.destroy();
+      entry.box.remove();
+      img.removeAttribute("zia-media-loading");
+    };
+
+    const start = (img) => {
+      const frame = img.parentNode;
+      if (live.has(img) || !frame || !ultraOn() || libraryZenLook()) {
+        return;
+      }
+      const box = document.createElementNS(XHTML_NS, "div");
+      box.className = "zia-media-load";
+      frame.append(box);
+      let fx = null;
+      try {
+        fx = ziaImgFx(box, {
+          preset: "pixels-organic",
+          dark: !root.hasAttribute("zia-light"),
+          // (a picture read from disk comes at once: long enough to read as the loader)
+          minChurnMs: 450,
+          revealSeconds: 1.6,
+        });
+      } catch (err) {
+        noteError("ultra: media loader", err);
+      }
+      if (!fx) {
+        box.remove();
+        return;
+      }
+      img.setAttribute("zia-media-loading", "true");
+      live.set(img, { fx, box });
+      const reveal = () => {
+        if (live.get(img)?.fx !== fx) {
+          return;
+        }
+        if (!img.naturalWidth) {
+          finish(img);
+          return;
+        }
+        // the picture's own box (shown whole, no larger than it is), then into it
+        const fw = frame.clientWidth;
+        const fh = frame.clientHeight;
+        const k = Math.min(1, fw / img.naturalWidth, fh / img.naturalHeight);
+        const w = img.naturalWidth * k;
+        const h = img.naturalHeight * k;
+        Object.assign(box.style, { left: `${(fw - w) / 2}px`, top: `${(fh - h) / 2}px`, width: `${w}px`, height: `${h}px` });
+        // (once the mosaic has taken the new size)
+        requestAnimationFrame(() => requestAnimationFrame(() => live.get(img)?.fx === fx && fx.reveal(img, { onDone: () => finish(img) })));
+      };
+      if (img.complete) {
+        reveal();
+      } else {
+        img.addEventListener("load", reveal, { once: true });
+        img.addEventListener("error", () => finish(img), { once: true });
+      }
+    };
+
+    new MutationObserver((records) => {
+      for (const record of records) {
+        for (const node of record.addedNodes) {
+          if (node.nodeType === 1 && node.matches(THUMB)) {
+            start(node);
+          }
+        }
+      }
+      for (const img of live.keys()) {
+        if (!img.isConnected) {
+          finish(img);
+        }
+      }
+    }).observe(library, { childList: true, subtree: true });
+  }
+
+  function watchUltra() {
+    safely("watchUltraOrbs", watchUltraOrbs);
+    safely("watchUltraGlow", watchUltraGlow);
+    safely("watchUltraMetalLine", watchUltraMetalLine);
+  }
+// Zia glow: a colourful glow along the bottom edge of a card that rises and
+// blooms while media plays. A framework-free port of the "glow" look of
+// voice-glow 0.3.0 (component VoiceBeam, https://libraries.dev).
+// voice-glow is MIT licensed:
+//
+//   MIT License
+//
+//   Copyright (c) 2026 Jakub Antalik
+//
+//   Permission is hereby granted, free of charge, to any person obtaining a copy
+//   of this software and associated documentation files (the "Software"), to deal
+//   in the Software without restriction, including without limitation the rights
+//   to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+//   copies of the Software, and to permit persons to whom the Software is
+//   furnished to do so, subject to the following conditions:
+//
+//   The above copyright notice and this permission notice shall be included in all
+//   copies or substantial portions of the Software.
+//
+//   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+//   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+//   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+//   AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+//   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+//   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+//   SOFTWARE.
+//
+//   const glow = ziaGlow(card, { dark: true });
+//   glow.setPlaying(true);   // fades in, follows a synthetic music level
+//   glow.setPlaying(false);  // the level settles and the glow fades out
+//   glow.setDark(false);     // switch palette and tuning
+//   glow.setColors(list);    // the lobes' colours ("rgb(r, g, b)"), or null for the theme's
+//   glow.setMotion(m);       // optional: the package's `motion` (see NOTES.md)
+//   glow.destroy();
+//
+// Plain functions in a shared scope: no imports or exports. Needs glow.css.
+// Elements are created in the XHTML namespace so it works in a XUL chrome document.
+
+const ZIA_GLOW_XHTML = "http://www.w3.org/1999/xhtml";
+const ZIA_GLOW_SVG = "http://www.w3.org/2000/svg";
+const ZIA_GLOW_TAU = Math.PI * 2;
+
+// Seven soft ellipses fanned out from the bottom centre, in px for a ~350px host:
+// the centre lobe follows the lows, its neighbours the mids, the outer pair the
+// highs and the far pair the mids again.
+const ZIA_GLOW_LOBES = [
+  { x: 0, w: 74, h: 46, band: 0 },
+  { x: -36, w: 54, h: 40, band: 1 },
+  { x: 36, w: 54, h: 40, band: 1 },
+  { x: -72, w: 48, h: 32, band: 2 },
+  { x: 72, w: 48, h: 32, band: 2 },
+  { x: -108, w: 42, h: 26, band: 1 },
+  { x: 108, w: 42, h: 26, band: 1 },
+];
+const ZIA_GLOW_SPAN = 36 * ZIA_GLOW_LOBES.length; // the flow ring, 252px
+
+// Theme tuning of the "colorful" variant on the "default" (chat input) type, resolved
+// the way VoiceBeam resolves it: theme preset, then type style, then light overrides.
+const ZIA_GLOW_THEMES = {
+  dark: {
+    colors: [
+      "rgb(255, 70, 120)",
+      "rgb(60, 190, 255)",
+      "rgb(175, 70, 255)",
+      "rgb(60, 220, 130)",
+      "rgb(255, 150, 40)",
+      "rgb(90, 100, 255)",
+      "rgb(40, 200, 190)",
+    ],
+    band: { core: "255, 255, 255", above: "255, 70, 80", mid: "90, 255, 150", below: "80, 140, 255" },
+    strokeOpacity: 1.16,
+    innerOpacity: 0.47,
+    bloomOpacity: 0.89,
+    bloomAlpha: 0.9,
+    innerShadow: "rgba(255, 255, 255, 0.1)",
+    brightness: 1.15,
+    saturation: 1.2,
+    strength: 1,
+    hueBase: 0,
+    hueRange: 24,
+    hueDuration: 12,
+    reach: 1.2,
+    spread: 1.05,
+    bandStrength: 1.55,
+    coreLight: 0,
+  },
+  light: {
+    colors: [
+      "rgb(255, 201, 21)",
+      "rgb(126, 196, 255)",
+      "rgb(180, 40, 230)",
+      "rgb(235, 100, 160)",
+      "rgb(255, 176, 122)",
+      "rgb(154, 160, 255)",
+      "rgb(127, 217, 238)",
+    ],
+    band: { core: "197, 139, 255", above: "255, 122, 182", mid: "126, 196, 255", below: "45, 255, 171" },
+    strokeOpacity: 1.2,
+    innerOpacity: 0.85,
+    bloomOpacity: 0.5,
+    bloomAlpha: 0.7,
+    innerShadow: "rgba(0, 0, 0, 0.08)",
+    brightness: 0.95,
+    saturation: 1.6,
+    strength: 0.8,
+    hueBase: 5,
+    hueRange: 40,
+    hueDuration: 8.5,
+    reach: 1.8,
+    spread: 0.8,
+    bandStrength: 1.7,
+    coreLight: 1.8,
+  },
+};
+
+// The package's defaults (voiceDefaults + the component's response defaults).
+const ZIA_GLOW_TUNING = {
+  threshold: 0.015,
+  attack: 0.325,
+  release: 0.86,
+  idle: 0.18,
+  breatheDuration: 5.2,
+  bands: true,
+  flow: 48,
+  bend: 60,
+  glowSize: 1,
+  bandWidth: 2.15,
+  bandPosition: 0.35,
+  bandCurve: 1.75,
+  bandSpread: 0.87,
+  bandSkew: 0.12,
+  bandOffset: -27,
+  bandTail: 0.59,
+  bandTailPosition: 0.67,
+  bandTailCurve: 2.4,
+  bandTailOverflow: 15,
+  bandAberration: 0.89,
+  distortion: 0.62,
+  distortionDetail: 2.3,
+  glowWidth: 0.65,
+  glowHeight: 1.25,
+  lobeSpacing: 0.85,
+  rangeWidth: 0.75,
+  rangeHeight: 1,
+  softness: 1.07,
+  coreSize: 1,
+  coreLightWidth: 1,
+  coreLightHeight: 1,
+  strokeScale: 1,
+  innerScale: 1,
+  innerHeight: 1,
+  bloomScale: 1,
+  bloomHeight: 1,
+};
+
+// libraries.dev shrinks the glow on narrow hosts with scale = min(1, width / 371).
+const ZIA_GLOW_HOST_WIDTH = 371;
+const ZIA_GLOW_MIN_SCALE = 0.4;
+// The level held under prefers-reduced-motion (a still glow, about mid-height).
+const ZIA_GLOW_STEADY = 0.18;
+// Fade timings of the package (0.6s in, 0.5s out, CSS "ease"), mirrored in glow.css.
+const ZIA_GLOW_FADE_OUT_MS = 520;
+const ZIA_GLOW_BAND_POINTS = 56;
+const ZIA_GLOW_STILL = { gather: 0, offset: 0, stretch: 0, heldLevel: 0, cornerFollow: 0 };
+
+const ziaGlowLive = new Set(); // instances the loop draws
+const ziaGlowAll = new Set(); // every instance not destroyed, for media-query changes
+let ziaGlowRaf = null;
+let ziaGlowLastFrame = 0;
+let ziaGlowPrevTs = 0;
+let ziaGlowHalfRate = false;
+let ziaGlowSkip = false;
+let ziaGlowSlowSince = 0;
+let ziaGlowProbeAt = 0;
+let ziaGlowMotionQuery = null;
+let ziaGlowListening = false;
+let ziaGlowCount = 0;
+
+function ziaGlowClamp(v) {
+  return v < 0 ? 0 : v > 1 ? 1 : v;
+}
+
+// Noise gate and soft saturation: below the threshold is silence.
+function ziaGlowShape(v, threshold) {
+  if (v <= threshold) {
+    return 0;
+  }
+  const a = (v - threshold) / Math.max(1e-3, 1 - threshold);
+  return ziaGlowClamp((1 - Math.exp(-3 * a)) / (1 - Math.exp(-3)));
+}
+
+// Attack / release envelope (seconds are time constants).
+function ziaGlowFollow(current, target, dt, attack, release) {
+  const tau = target > current ? attack : release;
+  return current + (target - current) * (1 - Math.exp(-dt / Math.max(1e-3, tau)));
+}
+
+// Wrap into [-span/2, span/2): the lobes cycle through the centre.
+function ziaGlowWrap(x, span) {
+  const half = span / 2;
+  return (((x + half) % span) + span) % span - half;
+}
+
+// Lobes shrink to nothing as they reach the ends of the flow ring.
+function ziaGlowRingFade(x, span) {
+  const k = x / (span / 2 + 4);
+  return Math.max(0, 1 - k * k);
+}
+
+// The band's organic bell, exp(-(|x| / spread)^curve), skewed and settled to 0 at |x| = 1.
+function ziaGlowBell(x, curve, spread, skew) {
+  const s = Math.max(0.05, spread * (x < 0 ? 1 - skew : 1 + skew));
+  const v = Math.exp(-Math.pow(Math.abs(x) / s, curve));
+  const end = Math.exp(-Math.pow(1 / s, curve));
+  return Math.max(0, (v - end) / (1 - end));
+}
+
+// The band's ends rising again into the corners.
+function ziaGlowTail(dist, reach, amount, position, curve) {
+  if (amount <= 0 || reach <= 0) {
+    return 0;
+  }
+  const start = reach * Math.max(0, Math.min(0.98, position));
+  if (dist <= start) {
+    return 0;
+  }
+  const k = Math.min(1, (dist - start) / Math.max(1, reach - start));
+  return amount * Math.pow(k, Math.max(0.5, curve));
+}
+
+function ziaGlowCornerRadius(radius, w, h) {
+  return Math.max(0, Math.min(radius, w / 2, h / 2));
+}
+
+// How far a corner of radius r lifts the bottom edge at x: a quarter of
+// |x|^n + |y|^n = 1, a circle at n = 2.
+function ziaGlowArc(x, w, r, inset = 0, n = 2) {
+  if (r <= 0) {
+    return 0;
+  }
+  const d = Math.min(x, w - x) - inset;
+  if (d >= r) {
+    return 0;
+  }
+  if (d <= 0) {
+    return r;
+  }
+  const k = (r - d) / r;
+  return r - r * Math.pow(Math.max(0, 1 - Math.pow(k, n)), 1 / n);
+}
+
+// The host's corner-shape: the one given, else its own.
+function ziaGlowCornerShapeOf(container, given) {
+  const style = getComputedStyle(container);
+  return (given || style.getPropertyValue("corner-bottom-left-shape") || style.getPropertyValue("corner-shape") || "")
+    .trim()
+    .split(/\s+(?![^(]*\))/)[0];
+}
+
+// Its exponent: CSS draws corner-shape superellipse(K) as |x|^n + |y|^n = 1 with
+// n = 2^K (round is K = 1, squircle K = 2).
+function ziaGlowCornerExp(shape) {
+  const named = { round: 1, squircle: 2, bevel: 0, square: 8 };
+  let k = named[shape];
+  const m = shape.match(/^superellipse\(\s*([^)]*)\)$/);
+  if (m) {
+    k = parseFloat(m[1]);
+    if (!Number.isFinite(k)) {
+      k = /^-/.test(m[1].trim()) ? 0 : 8;
+    }
+  }
+  return Math.pow(2, Math.max(0, Math.min(8, k ?? 1)));
+}
+
+// The host's outline as a path, inset by `inset`: its corners as CSS draws them.
+function ziaGlowOutlinePath(w, h, r, n, inset) {
+  const x0 = inset;
+  const y0 = inset;
+  const x1 = w - inset;
+  const y1 = h - inset;
+  const rr = Math.max(0, Math.min(r - inset, (x1 - x0) / 2, (y1 - y0) / 2));
+  const e = 2 / n;
+  const f = (v) => v.toFixed(2);
+  const pts = [];
+  for (const [cx, cy, a0] of [
+    [x0 + rr, y0 + rr, Math.PI],
+    [x1 - rr, y0 + rr, 1.5 * Math.PI],
+    [x1 - rr, y1 - rr, 0],
+    [x0 + rr, y1 - rr, 0.5 * Math.PI],
+  ]) {
+    for (let i = 0; i <= 16; i++) {
+      const a = a0 + (Math.PI / 2) * (i / 16);
+      const c = Math.cos(a);
+      const s = Math.sin(a);
+      pts.push(
+        `${f(cx + rr * Math.sign(c) * Math.pow(Math.abs(c), e))} ${f(cy + rr * Math.sign(s) * Math.pow(Math.abs(s), e))}`
+      );
+    }
+  }
+  return `M ${pts.join(" L ")} Z`;
+}
+
+// The glow is clipped to the host's outline, and its edge stroke drawn along it,
+// as paths: Firefox clips overflow (and masks) to a round corner whatever the
+// corner-shape, and the glow came out rounder than a squircle card.
+function ziaGlowOutline(g, w, h) {
+  const { radius, cornerN } = g.cfg;
+  const key = `${w} ${h} ${radius} ${cornerN}`;
+  if (key === g.outlineKey) {
+    return;
+  }
+  g.outlineKey = key;
+  const outer = ziaGlowOutlinePath(w, h, radius, cornerN, 0);
+  const inner = ziaGlowOutlinePath(w, h, radius, cornerN, 1);
+  g.root.style.setProperty("--zg-outline", `path("${outer}")`);
+  g.root.style.setProperty("--zg-ring", `path(evenodd, "${outer} ${inner}")`);
+}
+
+// The band's fringes in the lobes' colours (light themes tint the core too).
+function ziaGlowBandFrom(colors, T) {
+  const rgb = (c) => (String(c).match(/\d+(\.\d+)?/g) || [255, 255, 255]).slice(0, 3).join(", ");
+  return {
+    core: T === ZIA_GLOW_THEMES.dark ? T.band.core : rgb(colors[0]),
+    above: rgb(colors[0]),
+    mid: rgb(colors[1]),
+    below: rgb(colors[2]),
+  };
+}
+
+// A believable, gentle "music is playing" level (0..1, before the gate and envelope):
+// a slow phrase swell, a slower sway, a soft beat and a wandering random energy.
+function ziaGlowMusicNew() {
+  const r = Math.random;
+  return {
+    swell: r() * ZIA_GLOW_TAU,
+    sway: r() * ZIA_GLOW_TAU,
+    beat: (92 + r() * 34) / 60, // 92-126 bpm
+    from: r(),
+    to: r(),
+    at: 0,
+    dur: 0.6,
+  };
+}
+
+function ziaGlowMusic(m, t) {
+  if (t >= m.at + m.dur || t < m.at) {
+    m.from = m.to;
+    m.to = Math.random();
+    m.at = t;
+    m.dur = 0.35 + Math.random() * 0.85;
+  }
+  const k = (1 - Math.cos(Math.PI * Math.min(1, (t - m.at) / m.dur))) / 2;
+  const energy = m.from + (m.to - m.from) * k;
+  const swell = 0.5 + 0.5 * Math.sin(t * 0.83 + m.swell); // ~7.6s phrases
+  const sway = 0.5 + 0.5 * Math.sin(t * 2.1 + m.sway); // ~3s
+  const beat = Math.pow(0.5 + 0.5 * Math.cos(ZIA_GLOW_TAU * m.beat * t), 6);
+  return 0.08 + 0.08 * swell + 0.04 * sway + 0.05 * beat + 0.08 * energy;
+}
+
+function ziaGlowScaleFor(width) {
+  const s = Math.min(1, width / ZIA_GLOW_HOST_WIDTH);
+  return Math.max(ZIA_GLOW_MIN_SCALE, Math.round(s * 50) / 50);
+}
+
+function ziaGlowRadiusOf(container) {
+  const r = parseFloat(getComputedStyle(container).borderTopLeftRadius);
+  return r > 0 ? r : 16;
+}
+
+function ziaGlowReducedMotion() {
+  if (!ziaGlowMotionQuery && typeof matchMedia === "function") {
+    ziaGlowMotionQuery = matchMedia("(prefers-reduced-motion: reduce)");
+  }
+  return !!ziaGlowMotionQuery?.matches;
+}
+
+function ziaGlowListen() {
+  if (ziaGlowListening) {
+    return;
+  }
+  ziaGlowListening = true;
+  ziaGlowReducedMotion();
+  ziaGlowMotionQuery?.addEventListener("change", () => {
+    for (const g of ziaGlowAll) {
+      if (g.playing) {
+        ziaGlowWake(g);
+      }
+    }
+  });
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) {
+      ziaGlowStop();
+    } else {
+      ziaGlowStart();
+    }
+  });
+}
+
+// Per theme and scale: the CSS the layers paint with. Everything that moves is a
+// custom property on the root that the loop writes each frame.
+function ziaGlowBuild(g, scale) {
+  const T = g.dark ? ZIA_GLOW_THEMES.dark : ZIA_GLOW_THEMES.light;
+  const P = ZIA_GLOW_TUNING;
+  const colors = g.colors || T.colors;
+  const F = scale;
+  const cfg = {
+    dark: g.dark,
+    scale: F,
+    radius: ziaGlowRadiusOf(g.container),
+    cornerShape: ziaGlowCornerShapeOf(g.container, g.cornerShape),
+    threshold: P.threshold,
+    attack: P.attack,
+    release: P.release,
+    idle: P.idle,
+    breatheDuration: P.breatheDuration,
+    bands: P.bands,
+    flow: P.flow * F,
+    bend: P.bend * F,
+    reach: T.reach,
+    spread: T.spread,
+    lobeSpacing: P.lobeSpacing * F,
+    rangeWidth: P.rangeWidth * F,
+    rangeHeight: P.rangeHeight * F,
+    bandStrength: T.bandStrength,
+    bandWidth: P.bandWidth * F,
+    bandPosition: P.bandPosition,
+    bandCurve: P.bandCurve,
+    bandSpread: P.bandSpread,
+    bandSkew: P.bandSkew,
+    bandOffset: P.bandOffset * F,
+    bandTail: P.bandTail,
+    bandTailPosition: P.bandTailPosition,
+    bandTailCurve: P.bandTailCurve,
+    bandTailOverflow: P.bandTailOverflow * F,
+    bandAberration: P.bandAberration,
+    bandColors: g.colors ? ziaGlowBandFrom(g.colors, T) : T.band,
+    distortion: g.displace ? P.distortion : 0,
+    coreLight: T.coreLight,
+    // (a narrower drift for colours given, so they stay the picture's)
+    hueRange: g.colors ? Math.min(10, T.hueRange) : T.hueRange,
+    hueDuration: T.hueDuration,
+  };
+  cfg.cornerN = ziaGlowCornerExp(cfg.cornerShape);
+  g.cfg = cfg;
+  g.dirty = false;
+
+  const r1 = (v) => Math.round(v * 10) / 10;
+  const glowWidth = P.glowWidth * F;
+  const glowHeight = P.glowHeight * F;
+  const coreSize = P.coreSize * F;
+  const glowSize = P.glowSize * F;
+  const fade = Math.round(Math.max(40, Math.min(95, 70 * P.softness)));
+  const edge = r1(28 * F);
+  const shadow = r1(9 * F);
+  const at = "calc(50% + var(--zg-cx) * var(--zg-w))";
+
+  const lobes = (alpha, sw, sh, y, stop) =>
+    ZIA_GLOW_LOBES.map((lobe, i) => {
+      const color =
+        alpha >= 1 ? colors[i] : colors[i].replace("rgb(", "rgba(").replace(")", `, ${alpha.toFixed(2)})`);
+      return (
+        `radial-gradient(ellipse calc(${Math.round(lobe.w * sw)}px * var(--zg-w)) ` +
+        `calc(${Math.round(lobe.h * sh)}px * var(--zg-h) * var(--zg-l${i})) ` +
+        `at calc(50% + (var(--zg-cx) + var(--zg-x${i})) * var(--zg-w)) calc(100% + ${y}px + var(--zg-y${i})), ` +
+        `${color} 0%, transparent ${stop}%)`
+      );
+    }).join(", ");
+
+  // The visible range: a centred ellipse whose top humps up with the bend.
+  const range = (rw, rh, mid, rim) =>
+    `radial-gradient(ellipse calc(${r1(rw * cfg.rangeWidth)}px * var(--zg-w) * var(--zg-mw)) ` +
+    `calc(${r1(rh * cfg.rangeHeight)}px * var(--zg-h) + var(--zg-bh)) at ${at} calc(100% + var(--zg-cy)), ` +
+    `white 0%, rgba(255, 255, 255, 0.5) ${mid}%${rim > 0 ? `, rgba(255, 255, 255, ${rim}) 85%` : ""}, transparent 100%)`;
+
+  // The hot spot in the stroke: white on dark, an ink core on light.
+  const spot = g.dark
+    ? `radial-gradient(ellipse calc(${r1(30 * coreSize)}px * var(--zg-w)) calc(${r1(30 * coreSize)}px * var(--zg-h)) ` +
+      `at ${at} calc(100% + 2px + var(--zg-cy)), rgba(255, 255, 255, 0.45) 0%, rgba(255, 255, 255, 0.14) 30%, transparent 65%)`
+    : `radial-gradient(ellipse calc(${r1(40 * coreSize)}px * var(--zg-w)) calc(${r1(30 * coreSize)}px * var(--zg-h)) ` +
+      `at ${at} calc(100% + 2px + var(--zg-cy)), rgba(0, 0, 0, 0.55) 0%, rgba(0, 0, 0, 0.22) 35%, transparent 70%)`;
+
+  const strokeBg = `${spot}, ${lobes(1, glowWidth * P.strokeScale, glowHeight * P.strokeScale, 2, fade)}`;
+  const strokeMask = range(170, 64, 45, 0);
+  const innerBg = lobes(
+    0.46,
+    glowWidth * 0.9 * P.innerScale,
+    glowHeight * 0.9 * P.innerScale * P.innerHeight,
+    0,
+    fade
+  );
+  const innerMask =
+    `${range(170, 64, 45, 0.3)}, ` +
+    `linear-gradient(white, transparent ${edge}px, transparent calc(100% - ${edge}px), white), ` +
+    `linear-gradient(to right, white, transparent ${edge}px, transparent calc(100% - ${edge}px), white)`;
+  const bloomBg = lobes(
+    T.bloomAlpha,
+    glowWidth * 1.15 * P.bloomScale,
+    glowHeight * 1.5 * P.bloomScale * P.bloomHeight,
+    0,
+    Math.min(95, fade + 2)
+  );
+  const bloomMask = range(200, 130, 35, 0);
+
+  const set = (el, prop, value) => el && el.style.setProperty(prop, value);
+  set(g.stroke, "background", strokeBg);
+  set(g.stroke, "mask-image", strokeMask);
+  for (const el of [g.inner, g.innerWarp]) {
+    set(el, "background", innerBg);
+    set(el, "mask-image", innerMask);
+  }
+  for (const el of [g.bloom, g.bloomWarp]) {
+    set(el, "background", bloomBg);
+    set(el, "mask-image", bloomMask);
+  }
+
+  const root = g.root.style;
+  root.setProperty(
+    "--zg-tone",
+    `hue-rotate(calc(${T.hueBase}deg + var(--zg-hue))) brightness(${T.brightness.toFixed(2)}) saturate(${T.saturation.toFixed(2)})`
+  );
+  root.setProperty("--zg-blur", `${r1(Math.max(0.5, Math.round(10 * glowSize * 100) / 100))}px`);
+  root.setProperty("--zg-shadow", `inset 0 0 ${shadow}px 1px ${T.innerShadow}`);
+  root.setProperty("--zg-stroke-k", T.strokeOpacity.toFixed(2));
+  root.setProperty("--zg-inner-k", T.innerOpacity.toFixed(2));
+  root.setProperty("--zg-bloom-k", T.bloomOpacity.toFixed(2));
+  root.setProperty("--zg-strength", String(T.strength));
+
+  // The epicentre: a white wash at the source under the band line (light theme).
+  const light = Math.max(0, Math.min(3, cfg.coreLight));
+  g.root.toggleAttribute("data-core", light > 0);
+  if (light > 0) {
+    const w = Math.max(0, Math.min(2, light - 1));
+    const a = Math.min(1, w);
+    const b = Math.max(0, w - 1);
+    const grow = 1 + 0.3 * w;
+    const solid = r1(45 * a + 27 * b);
+    const mid = r1(40 + 25 * a + 15 * b);
+    const midAlpha = Math.min(1, 0.55 + 0.35 * a + 0.1 * b).toFixed(2);
+    const end = r1(72 + 14 * a + 8 * b);
+    set(
+      g.coreFill,
+      "background",
+      `radial-gradient(ellipse calc(${r1(120 * P.coreLightWidth * grow * F)}px * var(--zg-w)) ` +
+        `calc(${r1(70 * P.coreLightHeight * grow * F)}px * var(--zg-h) + var(--zg-bh)) at ${at} calc(100% + var(--zg-cy)), ` +
+        `white 0%, white ${solid}%, rgba(255, 255, 255, ${midAlpha}) ${mid}%, transparent ${end}%)`
+    );
+    root.setProperty("--zg-core-blur", `${r1(Math.max(0.5, Math.round(8 * glowSize * 100) / 100))}px`);
+    root.setProperty("--zg-core-k", (Math.min(1, light) * (1.6 + 1.4 * w)).toFixed(2));
+  }
+
+  if (g.turbulence) {
+    const detail = P.distortionDetail / F;
+    g.turbulence.setAttribute("baseFrequency", `${(0.012 * detail).toFixed(4)} ${(0.05 * detail).toFixed(4)}`);
+  }
+}
+
+// The band line: a bell over the glow's range, ends rising into the corners.
+function ziaGlowBandPoints(cfg, e, w, h) {
+  const cx = w / 2 + e.cx * e.w;
+  const half = 170 * cfg.rangeWidth * e.w * e.mw;
+  const cap = h * 0.82 * Math.min(1, cfg.scale);
+  const peak = Math.min(cap, (64 * cfg.rangeHeight * e.h + e.lift) * cfg.bandPosition);
+  const base = h - cfg.bandOffset;
+  const c = Math.min(1, e.corner * 4);
+  const tail = cfg.bandTail * (1 - c * c * (3 - 2 * c));
+  const hasTail = tail > 1e-3;
+  const over = hasTail ? cfg.bandTailOverflow : 0;
+  const x0 = hasTail ? -over : cx - half;
+  const x1 = hasTail ? w + over : cx + half;
+  const radius = ziaGlowCornerRadius(cfg.radius, w, h);
+  const pts = [];
+  for (let i = 0; i <= ZIA_GLOW_BAND_POINTS; i++) {
+    const x = x0 + ((x1 - x0) * i) / ZIA_GLOW_BAND_POINTS;
+    const u = Math.max(-1, Math.min(1, (x - cx) / Math.max(1, half)));
+    const reach = (x < cx ? cx : w - cx) + over;
+    const d =
+      ziaGlowBell(u, cfg.bandCurve, cfg.bandSpread, cfg.bandSkew) +
+      ziaGlowTail(Math.abs(x - cx), reach, tail, cfg.bandTailPosition, cfg.bandTailCurve);
+    const lift = e.corner > 0 ? ziaGlowArc(x, w, radius, 0, cfg.cornerN) * e.corner : 0;
+    pts.push([x, base - peak * d - lift]);
+  }
+  return pts;
+}
+
+// Clip polygons above / below the band line: only the glow under it warps.
+function ziaGlowClip(g, pts, w, h) {
+  const px = (v) => v.toFixed(1) + "px";
+  const line = pts.map(([x, y]) => `${px(x)} ${px(y)}`);
+  g.root.style.setProperty("--zg-clip-below", `polygon(0 ${px(h)}, ${line.join(", ")}, ${px(w)} ${px(h)})`);
+  g.root.style.setProperty(
+    "--zg-clip-above",
+    `polygon(0 0, ${px(w)} 0, ${px(w)} ${px(h)}, ${line.reverse().join(", ")}, 0 ${px(h)})`
+  );
+}
+
+// Narrow the filter region to the strip under the band line.
+function ziaGlowFilterRegion(g, pts, h) {
+  let top = h;
+  for (const p of pts) {
+    if (p[1] < top) {
+      top = p[1];
+    }
+  }
+  const y = Math.max(0, Math.min(0.9, Math.floor((top - 6) / h / 0.05) * 0.05));
+  if (y === g.filterTop) {
+    return;
+  }
+  g.filterTop = y;
+  const bottom = 1 + Math.max(0.1, 12 / h);
+  g.filter.setAttribute("x", "-10%");
+  g.filter.setAttribute("width", "120%");
+  g.filter.setAttribute("y", `${(y * 100).toFixed(0)}%`);
+  g.filter.setAttribute("height", `${((bottom - y) * 100).toFixed(1)}%`);
+}
+
+// The band canvas: a soft halo and four chromatic fringes along the line.
+function ziaGlowDrawBand(g, e, pts, w, h) {
+  const { canvas, ctx, cfg } = g;
+  if (!ctx) {
+    return;
+  }
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  const cw = Math.round(w * dpr);
+  const ch = Math.round(h * dpr);
+  if (canvas.width !== cw || canvas.height !== ch) {
+    canvas.width = cw;
+    canvas.height = ch;
+  }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+  const strength = Math.min(1, 0.6 * cfg.bandStrength * e.strength);
+  if (strength < 5e-3 || cfg.bandWidth <= 0) {
+    return;
+  }
+  const width = cfg.bandWidth * (1 + 0.35 * e.level);
+  const split = cfg.bandAberration * (0.35 + 0.65 * e.level);
+  const dy = (4 + 12 * split) * cfg.scale;
+  const dx = 4 * split * cfg.scale;
+  const alpha = (cfg.dark ? 0.42 : 0.4) * strength;
+  const line = 14 * width;
+  const blur = ((3.5 * cfg.bandWidth) / 2) * dpr;
+  const colors = cfg.bandColors;
+  const passes = [
+    [1, 0.16],
+    [0.72, 0.2],
+    [0.46, 0.26],
+    [0.22, 0.34],
+  ];
+  const fringes = [
+    { rgb: colors.above, a: 1, ox: dx, oy: -dy },
+    { rgb: colors.mid, a: 0.55, ox: dx * 0.35, oy: -dy * 0.35 },
+    { rgb: colors.below, a: 1, ox: -dx, oy: dy },
+    { rgb: colors.core, a: 0.9, ox: 0, oy: 0 },
+  ];
+  const x0 = pts[0][0];
+  const x1 = pts[pts.length - 1][0];
+  const k = cfg.bandTail > 0 ? 0.015 : 0.18;
+  const paint = (rgb, a) => {
+    const grad = ctx.createLinearGradient(x0, 0, x1, 0);
+    grad.addColorStop(0, `rgba(${rgb}, 0)`);
+    grad.addColorStop(k, `rgba(${rgb}, ${a.toFixed(3)})`);
+    grad.addColorStop(1 - k, `rgba(${rgb}, ${a.toFixed(3)})`);
+    grad.addColorStop(1, `rgba(${rgb}, 0)`);
+    return grad;
+  };
+  const trace = (ox, oy) => {
+    ctx.beginPath();
+    ctx.moveTo(pts[0][0] + ox, pts[0][1] + oy);
+    for (let i = 1; i < pts.length; i++) {
+      ctx.lineTo(pts[i][0] + ox, pts[i][1] + oy);
+    }
+  };
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+  ctx.globalCompositeOperation = "source-over";
+  ctx.filter = `blur(${(blur * 3).toFixed(1)}px)`;
+  ctx.strokeStyle = paint(colors.core, alpha * 0.3);
+  ctx.lineWidth = line * 2.2;
+  trace(0, 0);
+  ctx.stroke();
+  ctx.filter = `blur(${blur.toFixed(1)}px)`;
+  for (const f of fringes) {
+    for (const [lw, la] of passes) {
+      ctx.strokeStyle = paint(f.rgb, alpha * f.a * la);
+      ctx.lineWidth = Math.max(0.6, line * lw);
+      trace(f.ox, f.oy);
+      ctx.stroke();
+    }
+  }
+  ctx.filter = "none";
+}
+
+function ziaGlowMotionOf(g) {
+  const m = typeof g.motion === "function" ? g.motion() : g.motion;
+  if (!m) {
+    return ZIA_GLOW_STILL;
+  }
+  return {
+    gather: ziaGlowClamp(m.gather || 0),
+    offset: m.offset || 0,
+    stretch: ziaGlowClamp(m.stretch || 0),
+    heldLevel: ziaGlowClamp(m.heldLevel || 0),
+    cornerFollow: ziaGlowClamp(m.cornerFollow || 0),
+  };
+}
+
+// One frame of one instance: level -> envelope -> geometry -> custom properties.
+function ziaGlowStep(g, ts, reduced) {
+  const root = g.root;
+  const w = root.clientWidth;
+  const h = root.clientHeight;
+  if (!w || !h) {
+    return false;
+  }
+  const scale = ziaGlowScaleFor(w);
+  if (g.dirty || scale !== g.cfg?.scale) {
+    ziaGlowBuild(g, scale);
+  }
+  const cfg = g.cfg;
+  ziaGlowOutline(g, w, h);
+  const s = g.s;
+  const dt = s.lastTs ? Math.min(0.05, (ts - s.lastTs) / 1000) : 1 / 60;
+  s.lastTs = ts;
+  s.t += dt;
+  const t = s.t;
+
+  // The level: synthetic music while playing, silence while paused. The bands are
+  // synthesised from it the way VoiceBeam does for a `level` getter.
+  const d = g.playing ? (reduced ? ZIA_GLOW_STEADY : ziaGlowClamp(ziaGlowMusic(g.music, t))) : 0;
+  const raw = reduced
+    ? [d, d * 0.72, d * 0.6]
+    : [d, d * (0.72 + 0.28 * Math.sin(t * 9.1)), d * (0.6 + 0.4 * Math.sin(t * 13.7 + 2))];
+  const level = ziaGlowShape(d, cfg.threshold);
+  s.level = reduced ? level : ziaGlowFollow(s.level, level, dt, cfg.attack, cfg.release);
+  for (let i = 0; i < 3; i++) {
+    const band = ziaGlowShape(raw[i], cfg.threshold * 0.6);
+    s.bands[i] = reduced ? band : ziaGlowFollow(s.bands[i], band, dt, cfg.attack, cfg.release * 1.15);
+  }
+
+  const m = ziaGlowMotionOf(g);
+  const gather = m.gather;
+  const ring = ZIA_GLOW_SPAN * cfg.lobeSpacing;
+  const cx = reduced ? 0 : (m.offset * ring) / 2;
+  const pull = 1 - gather * 0.6;
+  const narrow = 1 - gather * 0.45;
+  const stretch = 1 + gather * 0.3 * m.stretch;
+  const breathe = reduced ? 0.5 : 0.5 + 0.5 * Math.sin((ZIA_GLOW_TAU * t) / cfg.breatheDuration);
+  const voiced = s.level + (1 - s.level) * cfg.idle * breathe;
+  const held = Math.max(0, Math.min(1, (gather - 0.25) / 0.75));
+  const R = Math.max(voiced, m.heldLevel * held * held * (3 - 2 * held));
+  const glow = 0.15 + 0.85 * R;
+  const tall = 0.5 + cfg.reach * R;
+  const wide = (0.85 + cfg.spread * R) * stretch;
+  if (cfg.flow !== 0 && !reduced) {
+    s.phase = (((s.phase + cfg.flow * R * dt) % ring) + ring) % ring;
+  }
+
+  const st = root.style;
+  st.setProperty("--zg-cx", `${cx.toFixed(1)}px`);
+  st.setProperty("--zg-mw", narrow.toFixed(3));
+  const lift = cfg.bend * R;
+  st.setProperty("--zg-bh", `${Math.max(0, lift).toFixed(1)}px`);
+  const e = {
+    cx,
+    w: wide,
+    h: tall,
+    mw: narrow,
+    lift,
+    strength: cfg.bend > 0 ? Math.min(1, lift / cfg.bend) : 0,
+    level: s.level,
+    corner: gather,
+  };
+  const radius = ziaGlowCornerRadius(cfg.radius, w, h);
+  const follow = gather * m.cornerFollow;
+  const spot = 30 * cfg.scale * wide;
+  st.setProperty("--zg-cy", `${(-ziaGlowArc(w / 2 + cx * wide, w, radius, spot * 1.4, cfg.cornerN) * follow).toFixed(1)}px`);
+
+  // Distortion settles out while the glow is gathered, and is off under reduced motion.
+  s.warp = ziaGlowFollow(s.warp, gather > 0.02 ? 0 : 1, dt, 0.35, 0.06);
+  const warpOff = !g.displace || cfg.distortion <= 0 || reduced || s.warp < 0.03;
+  if (warpOff !== g.warpOff) {
+    g.warpOff = warpOff;
+    root.toggleAttribute("data-warp-off", warpOff);
+  }
+  const pts = ziaGlowBandPoints(cfg, e, w, h);
+  if (!warpOff || cfg.coreLight > 0) {
+    ziaGlowClip(g, pts, w, h);
+  }
+  if (!warpOff) {
+    ziaGlowFilterRegion(g, pts, h);
+    g.displace.scale.baseVal = cfg.distortion * 120 * cfg.scale * (0.15 + 0.85 * R) * s.warp;
+    g.shift.dx.baseVal = 8 * cfg.scale * Math.sin(t * 0.9);
+    g.shift.dy.baseVal = 4 * cfg.scale * Math.sin(t * 0.6 + 1.3);
+  }
+  ziaGlowDrawBand(g, e, pts, w, h);
+
+  st.setProperty("--zg-glow", glow.toFixed(3));
+  st.setProperty("--zg-h", tall.toFixed(3));
+  st.setProperty("--zg-w", wide.toFixed(3));
+  for (let i = 0; i < ZIA_GLOW_LOBES.length; i++) {
+    const lobe = ZIA_GLOW_LOBES[i];
+    const x = ziaGlowWrap(lobe.x * cfg.lobeSpacing + s.phase, ring);
+    const gain = cfg.bands ? 0.6 + 0.7 * s.bands[lobe.band] : 1;
+    st.setProperty(`--zg-x${i}`, `${(x * pull).toFixed(1)}px`);
+    st.setProperty(`--zg-l${i}`, (gain * ziaGlowRingFade(x, ring)).toFixed(3));
+    const lx = w / 2 + (cx + x * pull) * wide;
+    st.setProperty(`--zg-y${i}`, `${(-ziaGlowArc(lx, w, radius, spot, cfg.cornerN) * follow).toFixed(1)}px`);
+  }
+  const hue =
+    reduced || cfg.hueRange === 0
+      ? 0
+      : -cfg.hueRange + cfg.hueRange * (1 - Math.cos((ZIA_GLOW_TAU * t) / cfg.hueDuration));
+  st.setProperty("--zg-hue", `${hue.toFixed(2)}deg`);
+  return true;
+}
+
+// The shared loop: capped at ~60 fps, every other frame on a device that cannot hold
+// 60 (probing full rate again after 4s), stopped when nothing is left to draw.
+function ziaGlowFrame(ts) {
+  ziaGlowRaf = requestAnimationFrame(ziaGlowFrame);
+  const gap = ziaGlowPrevTs ? ts - ziaGlowPrevTs : 0;
+  ziaGlowPrevTs = ts;
+  if (ziaGlowHalfRate) {
+    ziaGlowSkip = !ziaGlowSkip;
+    if (ziaGlowSkip) {
+      return;
+    }
+    if (ts >= ziaGlowProbeAt) {
+      ziaGlowHalfRate = false;
+      ziaGlowSlowSince = 0;
+    }
+  } else if (gap > 22) {
+    if (!ziaGlowSlowSince) {
+      ziaGlowSlowSince = ts;
+    } else if (ts - ziaGlowSlowSince > 500) {
+      ziaGlowHalfRate = true;
+      ziaGlowSkip = false;
+      ziaGlowProbeAt = ts + 4000;
+    }
+  } else {
+    ziaGlowSlowSince = 0;
+  }
+  if (ts - ziaGlowLastFrame < 1000 / 60 - 2) {
+    return;
+  }
+  ziaGlowLastFrame = ts;
+
+  const reduced = ziaGlowReducedMotion();
+  for (const g of ziaGlowLive) {
+    if (!g.root.isConnected) {
+      ziaGlowLive.delete(g);
+      ziaGlowAll.delete(g);
+      continue;
+    }
+    if (!g.visible) {
+      ziaGlowLive.delete(g);
+      continue;
+    }
+    if (!g.playing) {
+      g.offAt ||= ts;
+      // keep following the settling level while the CSS fade-out runs
+      if (reduced || ts - g.offAt > ZIA_GLOW_FADE_OUT_MS) {
+        ziaGlowLive.delete(g);
+        continue;
+      }
+    }
+    const drawn = ziaGlowStep(g, ts, reduced);
+    if (reduced && drawn) {
+      ziaGlowLive.delete(g); // nothing moves under reduced motion: one still frame
+    }
+  }
+  if (!ziaGlowLive.size) {
+    ziaGlowStop();
+  }
+}
+
+function ziaGlowStart() {
+  if (ziaGlowRaf == null && ziaGlowLive.size && !document.hidden) {
+    ziaGlowLastFrame = 0;
+    ziaGlowPrevTs = 0;
+    ziaGlowSlowSince = 0;
+    ziaGlowRaf = requestAnimationFrame(ziaGlowFrame);
+  }
+}
+
+function ziaGlowStop() {
+  if (ziaGlowRaf != null) {
+    cancelAnimationFrame(ziaGlowRaf);
+    ziaGlowRaf = null;
+  }
+}
+
+function ziaGlowWake(g) {
+  if (g.destroyed) {
+    return;
+  }
+  ziaGlowAll.add(g);
+  if (!ziaGlowLive.has(g)) {
+    g.s.lastTs = 0;
+    ziaGlowLive.add(g);
+  }
+  ziaGlowStart();
+}
+
+function ziaGlow(container, { dark = true, cornerShape = "" } = {}) {
+  ziaGlowListen();
+  const doc = container.ownerDocument;
+  const id = `zia-glow-distort-${++ziaGlowCount}`;
+  const make = (cls, tag = "div") => {
+    const el = doc.createElementNS(ZIA_GLOW_XHTML, tag);
+    if (cls) {
+      el.className = cls;
+    }
+    return el;
+  };
+  const svgEl = (tag, attrs) => {
+    const el = doc.createElementNS(ZIA_GLOW_SVG, tag);
+    for (const [k, v] of Object.entries(attrs)) {
+      el.setAttribute(k, v);
+    }
+    return el;
+  };
+
+  // Layers, back to front as VoiceBeam stacks them: inner light (and its warp mirror),
+  // edge stroke, bloom (and its warp mirror), band canvas, epicentre.
+  const root = make("zia-glow");
+  root.setAttribute("aria-hidden", "true");
+  root.toggleAttribute("data-warp-off", true);
+  const inner = make("zia-glow-layer zia-glow-inner");
+  const innerWarp = make("zia-glow-layer zia-glow-inner zia-glow-warp");
+  const stroke = make("zia-glow-layer zia-glow-stroke");
+  const bloom = make("zia-glow-layer zia-glow-bloom");
+  const bloomWarp = make("zia-glow-layer zia-glow-bloom zia-glow-warp");
+  const canvas = make("zia-glow-layer zia-glow-band", "canvas");
+  const core = make("zia-glow-layer zia-glow-core");
+  const coreFill = make("");
+  core.append(coreFill);
+
+  // The distortion: drifting fractal noise, green pinned to 0.5 so only x displaces.
+  const svg = svgEl("svg", { width: "0", height: "0", class: "zia-glow-defs" });
+  const filter = svgEl("filter", {
+    id,
+    x: "-20%",
+    y: "-20%",
+    width: "140%",
+    height: "140%",
+    "color-interpolation-filters": "sRGB",
+  });
+  const turbulence = svgEl("feTurbulence", {
+    type: "fractalNoise",
+    baseFrequency: "0.04 0.17",
+    numOctaves: "2",
+    seed: "7",
+    result: "noise",
+  });
+  const shift = svgEl("feOffset", { in: "noise", dx: "0", dy: "0", result: "moved" });
+  const matrix = svgEl("feColorMatrix", {
+    in: "moved",
+    type: "matrix",
+    values: "1 0 0 0 0  0 0 0 0 0.5  0 0 0 0 0  0 0 0 0 1",
+    result: "map",
+  });
+  const displace = svgEl("feDisplacementMap", {
+    in: "SourceGraphic",
+    in2: "map",
+    scale: "0",
+    xChannelSelector: "R",
+    yChannelSelector: "G",
+  });
+  filter.append(turbulence, shift, matrix, displace);
+  svg.append(filter);
+  innerWarp.style.setProperty("filter", `var(--zg-tone) url(#${id})`);
+  bloomWarp.style.setProperty("filter", `blur(var(--zg-blur)) var(--zg-tone) url(#${id})`);
+
+  root.append(inner, innerWarp, stroke, bloom, bloomWarp, canvas, core, svg);
+  container.append(root);
+
+  const g = {
+    container,
+    root,
+    inner,
+    innerWarp,
+    stroke,
+    bloom,
+    bloomWarp,
+    canvas,
+    ctx: canvas.getContext("2d"),
+    coreFill,
+    filter,
+    turbulence,
+    shift,
+    displace,
+    filterTop: -1,
+    warpOff: true,
+    dark: !!dark,
+    cornerShape,
+    colors: null,
+    colorKey: "",
+    outlineKey: "",
+    dirty: true,
+    cfg: null,
+    playing: false,
+    offAt: 0,
+    visible: true,
+    destroyed: false,
+    motion: null,
+    music: ziaGlowMusicNew(),
+    s: { level: 0, bands: [0, 0, 0], phase: 0, t: 0, lastTs: 0, warp: 1 },
+  };
+
+  // Offscreen (a collapsed or slid-out sidebar): leave the loop until it shows again.
+  if (typeof IntersectionObserver === "function") {
+    g.io = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          g.visible = entry.isIntersecting;
+        }
+        if (g.visible && g.playing) {
+          ziaGlowWake(g);
+        }
+      },
+      { rootMargin: "256px" }
+    );
+    g.io.observe(root);
+  }
+  // A still frame (reduced motion) is redrawn when the card is resized.
+  if (typeof ResizeObserver === "function") {
+    g.ro = new ResizeObserver(() => {
+      if (g.playing && ziaGlowReducedMotion()) {
+        ziaGlowWake(g);
+      }
+    });
+    g.ro.observe(root);
+  }
+
+  return {
+    setPlaying(on) {
+      on = !!on;
+      if (g.destroyed || on === g.playing) {
+        return;
+      }
+      g.playing = on;
+      g.offAt = 0;
+      root.toggleAttribute("data-on", on);
+      ziaGlowWake(g);
+    },
+    setDark(on) {
+      on = !!on;
+      if (g.destroyed || on === g.dark) {
+        return;
+      }
+      g.dark = on;
+      g.dirty = true;
+      if (g.playing) {
+        ziaGlowWake(g);
+      }
+    },
+    // The lobes' colours, "rgb(r, g, b)" strings repeated round the seven, with the
+    // band's fringes from the first three; null for the theme's own.
+    setColors(list) {
+      list = Array.isArray(list) && list.length ? list : null;
+      const key = list ? list.join("|") : "";
+      if (g.destroyed || key === g.colorKey) {
+        return;
+      }
+      g.colorKey = key;
+      g.colors = list ? ZIA_GLOW_LOBES.map((_, i) => list[i % list.length]) : null;
+      g.dirty = true;
+      if (g.playing) {
+        ziaGlowWake(g);
+      }
+    },
+    // VoiceBeam's `motion`: { gather, offset, stretch, heldLevel, cornerFollow },
+    // or a getter sampled every frame, or null for the glow at rest.
+    setMotion(motion) {
+      g.motion = motion || null;
+      if (g.playing) {
+        ziaGlowWake(g);
+      }
+    },
+    destroy() {
+      if (g.destroyed) {
+        return;
+      }
+      g.destroyed = true;
+      g.io?.disconnect();
+      g.ro?.disconnect();
+      ziaGlowLive.delete(g);
+      ziaGlowAll.delete(g);
+      root.remove();
+      if (!ziaGlowLive.size) {
+        ziaGlowStop();
+      }
+    },
+  };
+}
+// ---------- Metal surfaces: Paper Shaders' liquidMetal as metal-fx draws it
+// The shader of metal-fx 2.0.11 (https://libraries.dev, "Liquid metal"), as
+// the welcome tour's metal.js has it, in the package's "silver" preset (its
+// plain metal: a white tint and only a touch of colour at the edges, where
+// "chromatic" splits it into colours), painted into canvases of Zia's own
+// rather than into lettering: one hidden WebGL2 canvas draws each surface in
+// turn and it's copied over.
+//
+//   const metal = ziaMetalSurface(canvas, { speed: 0.1, every: 120, light: false });
+//   metal.setLight(true);   // the preset's light tuning, for a light space
+//   metal.destroy();
+//
+// `speed` scales the shader's clock (1 is the package's), `every` is the ms
+// between frames (66, about 15 a second, is the package's), `band` takes a
+// thin strip through the middle of a squarer render (for a line, whose own
+// shape would squeeze the pattern). Still under reduced motion; nothing at
+// all without WebGL2. The canvas's own width and height set the resolution.
+//
+// metal-fx is MIT licensed:
+//
+//   MIT License
+//
+//   Copyright (c) 2026 Jakub Antalik
+//
+//   Permission is hereby granted, free of charge, to any person obtaining a copy
+//   of this software and associated documentation files (the "Software"), to deal
+//   in the Software without restriction, including without limitation the rights
+//   to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+//   copies of the Software, and to permit persons to whom the Software is
+//   furnished to do so, subject to the following conditions:
+//
+//   The above copyright notice and this permission notice shall be included in all
+//   copies or substantial portions of the Software.
+//
+//   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+//   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+//   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+//   AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+//   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+//   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+//   SOFTWARE.
+//
+// The package's NOTICE, which applies to the two shaders below:
+//
+//   metal-fx
+//   Copyright (c) Jakub Antalik
+//
+//   This product includes software developed by Paper Design, Inc.
+//
+//     Paper Shaders (https://github.com/paper-design/shaders)
+//     Copyright (c) Paper Design, Inc.
+//     Licensed under the Apache License, Version 2.0
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+//   The `liquidMetal` fragment shader is consumed unmodified from the
+//   `@paper-design/shaders` npm package; the sizing vertex shader is copied
+//   verbatim from `packages/shaders/src/vertex-shader.ts` @ 0.0.80. No changes
+//   were made to either shader's source (nor are any made here).
+
+// Shared GLSL pieces (Paper Shaders), copied verbatim from metal-fx's dist.
+const ZIA_METAL_DEFINES = `
+#define TWO_PI 6.28318530718
+#define PI 3.14159265358979323846
+`;
+const ZIA_METAL_ROTATE = `
+vec2 rotate(vec2 uv, float th) {
+return mat2(cos(th), sin(th), -sin(th), cos(th)) * uv;
+}
+`;
+const ZIA_METAL_GRAIN = `
+color += 1. / 256. * (fract(sin(dot(.014 * gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453123) - .5);
+`;
+const ZIA_METAL_SNOISE = `
+vec3 permute(vec3 x) { return mod(((x * 34.0) + 1.0) * x, 289.0); }
+float snoise(vec2 v) {
+const vec4 C = vec4(0.211324865405187, 0.366025403784439,
+  -0.577350269189626, 0.024390243902439);
+vec2 i = floor(v + dot(v, C.yy));
+vec2 x0 = v - i + dot(i, C.xx);
+vec2 i1;
+i1 = (x0.x > x0.y) ? vec2(1.0, 0.0) : vec2(0.0, 1.0);
+vec4 x12 = x0.xyxy + C.xxzz;
+x12.xy -= i1;
+i = mod(i, 289.0);
+vec3 p = permute(permute(i.y + vec3(0.0, i1.y, 1.0))
+  + i.x + vec3(0.0, i1.x, 1.0));
+vec3 m = max(0.5 - vec3(dot(x0, x0), dot(x12.xy, x12.xy),
+    dot(x12.zw, x12.zw)), 0.0);
+m = m * m;
+m = m * m;
+vec3 x = 2.0 * fract(p * C.www) - 1.0;
+vec3 h = abs(x) - 0.5;
+vec3 ox = floor(x + 0.5);
+vec3 a0 = x - ox;
+m *= 1.79284291400159 - 0.85373472095314 * (a0 * a0 + h * h);
+vec3 g;
+g.x = a0.x * x0.x + h.x * x0.y;
+g.yz = a0.yz * x12.xz + h.yz * x12.yw;
+return 130.0 * dot(m, g);
+}
+`;
+// Paper Shaders' liquidMetal fragment shader, as metal-fx inlines it.
+const ZIA_METAL_FRAG = `#version 300 es
+precision mediump float;
+
+uniform sampler2D u_image;
+uniform float u_imageAspectRatio;
+
+uniform vec2 u_resolution;
+uniform float u_time;
+
+uniform vec4 u_colorBack;
+uniform vec4 u_colorTint;
+
+uniform float u_softness;
+uniform float u_repetition;
+uniform float u_shiftRed;
+uniform float u_shiftBlue;
+uniform float u_distortion;
+uniform float u_contour;
+uniform float u_angle;
+
+uniform float u_shape;
+uniform bool u_isImage;
+
+in vec2 v_objectUV;
+in vec2 v_responsiveUV;
+in vec2 v_responsiveBoxGivenSize;
+in vec2 v_imageUV;
+
+out vec4 fragColor;
+
+${ZIA_METAL_DEFINES}
+${ZIA_METAL_ROTATE}
+${ZIA_METAL_SNOISE}
+
+float getColorChanges(float c1, float c2, float stripe_p, vec3 w, float blur, float bump, float tint) {
+
+float ch = mix(c2, c1, smoothstep(.0, 2. * blur, stripe_p));
+
+float border = w[0];
+ch = mix(ch, c2, smoothstep(border, border + 2. * blur, stripe_p));
+
+if (u_isImage == true) {
+  bump = smoothstep(.2, .8, bump);
+}
+border = w[0] + .4 * (1. - bump) * w[1];
+ch = mix(ch, c1, smoothstep(border, border + 2. * blur, stripe_p));
+
+border = w[0] + .5 * (1. - bump) * w[1];
+ch = mix(ch, c2, smoothstep(border, border + 2. * blur, stripe_p));
+
+border = w[0] + w[1];
+ch = mix(ch, c1, smoothstep(border, border + 2. * blur, stripe_p));
+
+float gradient_t = (stripe_p - w[0] - w[1]) / w[2];
+float gradient = mix(c1, c2, smoothstep(0., 1., gradient_t));
+ch = mix(ch, gradient, smoothstep(border, border + .5 * blur, stripe_p));
+
+// Tint color is applied with color burn blending
+ch = mix(ch, 1. - min(1., (1. - ch) / max(tint, 0.0001)), u_colorTint.a);
+return ch;
+}
+
+float getImgFrame(vec2 uv, float th) {
+float frame = 1.;
+frame *= smoothstep(0., th, uv.y);
+frame *= 1.0 - smoothstep(1. - th, 1., uv.y);
+frame *= smoothstep(0., th, uv.x);
+frame *= 1.0 - smoothstep(1. - th, 1., uv.x);
+return frame;
+}
+
+float blurEdge3x3(sampler2D tex, vec2 uv, vec2 dudx, vec2 dudy, float radius, float centerSample) {
+vec2 texel = 1.0 / vec2(textureSize(tex, 0));
+vec2 r = radius * texel;
+
+float w1 = 1.0, w2 = 2.0, w4 = 4.0;
+float norm = 16.0;
+float sum = w4 * centerSample;
+
+sum += w2 * textureGrad(tex, uv + vec2(0.0, -r.y), dudx, dudy).r;
+sum += w2 * textureGrad(tex, uv + vec2(0.0, r.y), dudx, dudy).r;
+sum += w2 * textureGrad(tex, uv + vec2(-r.x, 0.0), dudx, dudy).r;
+sum += w2 * textureGrad(tex, uv + vec2(r.x, 0.0), dudx, dudy).r;
+
+sum += w1 * textureGrad(tex, uv + vec2(-r.x, -r.y), dudx, dudy).r;
+sum += w1 * textureGrad(tex, uv + vec2(r.x, -r.y), dudx, dudy).r;
+sum += w1 * textureGrad(tex, uv + vec2(-r.x, r.y), dudx, dudy).r;
+sum += w1 * textureGrad(tex, uv + vec2(r.x, r.y), dudx, dudy).r;
+
+return sum / norm;
+}
+
+float lst(float edge0, float edge1, float x) {
+return clamp((x - edge0) / (edge1 - edge0), 0.0, 1.0);
+}
+
+void main() {
+
+const float firstFrameOffset = 2.8;
+float t = .3 * (u_time + firstFrameOffset);
+
+vec2 uv = v_imageUV;
+vec2 dudx = dFdx(v_imageUV);
+vec2 dudy = dFdy(v_imageUV);
+vec4 img = textureGrad(u_image, uv, dudx, dudy);
+
+if (u_isImage == false) {
+  uv = v_objectUV + .5;
+  uv.y = 1. - uv.y;
+}
+
+float cycleWidth = u_repetition;
+float edge = 0.;
+float contOffset = 1.;
+
+vec2 rotatedUV = uv - vec2(.5);
+float angle = (-u_angle + 70.) * PI / 180.;
+float cosA = cos(angle);
+float sinA = sin(angle);
+rotatedUV = vec2(
+rotatedUV.x * cosA - rotatedUV.y * sinA,
+rotatedUV.x * sinA + rotatedUV.y * cosA
+) + vec2(.5);
+
+if (u_isImage == true) {
+  float edgeRaw = img.r;
+  edge = blurEdge3x3(u_image, uv, dudx, dudy, 6., edgeRaw);
+  edge = pow(edge, 1.6);
+  edge *= mix(0.0, 1.0, smoothstep(0.0, 0.4, u_contour));
+} else {
+  if (u_shape < 1.) {
+    // full-fill on canvas
+    vec2 borderUV = v_responsiveUV + .5;
+    float ratio = v_responsiveBoxGivenSize.x / v_responsiveBoxGivenSize.y;
+    vec2 mask = min(borderUV, 1. - borderUV);
+    vec2 pixel_thickness = min(250. / v_responsiveBoxGivenSize, vec2(.5));
+    float maskX = smoothstep(0.0, pixel_thickness.x, mask.x);
+    float maskY = smoothstep(0.0, pixel_thickness.y, mask.y);
+    maskX = pow(maskX, .25);
+    maskY = pow(maskY, .25);
+    edge = clamp(1. - maskX * maskY, 0., 1.);
+
+    uv = v_responsiveUV;
+    if (ratio > 1.) {
+      uv.y /= ratio;
+    } else {
+      uv.x *= ratio;
+    }
+    uv += .5;
+    uv.y = 1. - uv.y;
+
+    cycleWidth *= 2.;
+    contOffset = 1.5;
+
+  } else if (u_shape < 2.) {
+    // circle
+    vec2 shapeUV = uv - .5;
+    shapeUV *= .67;
+    edge = pow(clamp(3. * length(shapeUV), 0., 1.), 18.);
+  } else if (u_shape < 3.) {
+    // daisy
+    vec2 shapeUV = uv - .5;
+    shapeUV *= 1.68;
+
+    float r = length(shapeUV) * 2.;
+    float a = atan(shapeUV.y, shapeUV.x) + .2;
+    r *= (1. + .05 * sin(3. * a + 2. * t));
+    float f = abs(cos(a * 3.));
+    edge = smoothstep(f, f + .7, r);
+    edge *= edge;
+
+    uv *= .8;
+    cycleWidth *= 1.6;
+
+  } else if (u_shape < 4.) {
+    // diamond
+    vec2 shapeUV = uv - .5;
+    shapeUV = rotate(shapeUV, .25 * PI);
+    shapeUV *= 1.42;
+    shapeUV += .5;
+    vec2 mask = min(shapeUV, 1. - shapeUV);
+    vec2 pixel_thickness = vec2(.15);
+    float maskX = smoothstep(0.0, pixel_thickness.x, mask.x);
+    float maskY = smoothstep(0.0, pixel_thickness.y, mask.y);
+    maskX = pow(maskX, .25);
+    maskY = pow(maskY, .25);
+    edge = clamp(1. - maskX * maskY, 0., 1.);
+  } else if (u_shape < 5.) {
+    // metaballs
+    vec2 shapeUV = uv - .5;
+    shapeUV *= 1.3;
+    edge = 0.;
+    for (int i = 0; i < 5; i++) {
+      float fi = float(i);
+      float speed = 1.5 + 2./3. * sin(fi * 12.345);
+      float angle = -fi * 1.5;
+      vec2 dir1 = vec2(cos(angle), sin(angle));
+      vec2 dir2 = vec2(cos(angle + 1.57), sin(angle + 1.));
+      vec2 traj = .4 * (dir1 * sin(t * speed + fi * 1.23) + dir2 * cos(t * (speed * 0.7) + fi * 2.17));
+      float d = length(shapeUV + traj);
+      edge += pow(1.0 - clamp(d, 0.0, 1.0), 4.0);
+    }
+    edge = 1. - smoothstep(.65, .9, edge);
+    edge = pow(edge, 4.);
+  }
+
+  edge = mix(smoothstep(.9 - 2. * fwidth(edge), .9, edge), edge, smoothstep(0.0, 0.4, u_contour));
+
+}
+
+float opacity = 0.;
+if (u_isImage == true) {
+  opacity = img.g;
+  float frame = getImgFrame(v_imageUV, 0.);
+  opacity *= frame;
+} else {
+  opacity = 1. - smoothstep(.9 - 2. * fwidth(edge), .9, edge);
+  if (u_shape < 2.) {
+    edge = 1.2 * edge;
+  } else if (u_shape < 5.) {
+    edge = 1.8 * pow(edge, 1.5);
+  }
+}
+
+float diagBLtoTR = rotatedUV.x - rotatedUV.y;
+float diagTLtoBR = rotatedUV.x + rotatedUV.y;
+
+vec3 color = vec3(0.);
+vec3 color1 = vec3(.98, 0.98, 1.);
+vec3 color2 = vec3(.1, .1, .1 + .1 * smoothstep(.7, 1.3, diagTLtoBR));
+
+vec2 grad_uv = uv - .5;
+
+float dist = length(grad_uv + vec2(0., .2 * diagBLtoTR));
+grad_uv = rotate(grad_uv, (.25 - .2 * diagBLtoTR) * PI);
+float direction = grad_uv.x;
+
+float bump = pow(1.8 * dist, 1.2);
+bump = 1. - bump;
+bump *= pow(uv.y, .3);
+
+
+float thin_strip_1_ratio = .12 / cycleWidth * (1. - .4 * bump);
+float thin_strip_2_ratio = .07 / cycleWidth * (1. + .4 * bump);
+float wide_strip_ratio = (1. - thin_strip_1_ratio - thin_strip_2_ratio);
+
+float thin_strip_1_width = cycleWidth * thin_strip_1_ratio;
+float thin_strip_2_width = cycleWidth * thin_strip_2_ratio;
+
+float noise = snoise(uv - t);
+
+edge += (1. - edge) * u_distortion * noise;
+
+direction += diagBLtoTR;
+float contour = 0.;
+direction -= 2. * noise * diagBLtoTR * (smoothstep(0., 1., edge) * (1.0 - smoothstep(0., 1., edge)));
+direction *= mix(1., 1. - edge, smoothstep(.5, 1., u_contour));
+direction -= 1.7 * edge * smoothstep(.5, 1., u_contour);
+direction += .2 * pow(u_contour, 4.) * (1.0 - smoothstep(0., 1., edge));
+
+bump *= clamp(pow(uv.y, .1), .3, 1.);
+direction *= (.1 + (1.1 - edge) * bump);
+
+direction *= (.4 + .6 * (1.0 - smoothstep(.5, 1., edge)));
+direction += .18 * (smoothstep(.1, .2, uv.y) * (1.0 - smoothstep(.2, .4, uv.y)));
+direction += .03 * (smoothstep(.1, .2, 1. - uv.y) * (1.0 - smoothstep(.2, .4, 1. - uv.y)));
+
+direction *= (.5 + .5 * pow(uv.y, 2.));
+direction *= cycleWidth;
+direction -= t;
+
+
+float colorDispersion = (1. - bump);
+colorDispersion = clamp(colorDispersion, 0., 1.);
+float dispersionRed = colorDispersion;
+dispersionRed += .03 * bump * noise;
+dispersionRed += 5. * (smoothstep(-.1, .2, uv.y) * (1.0 - smoothstep(.1, .5, uv.y))) * (smoothstep(.4, .6, bump) * (1.0 - smoothstep(.4, 1., bump)));
+dispersionRed -= diagBLtoTR;
+
+float dispersionBlue = colorDispersion;
+dispersionBlue *= 1.3;
+dispersionBlue += (smoothstep(0., .4, uv.y) * (1.0 - smoothstep(.1, .8, uv.y))) * (smoothstep(.4, .6, bump) * (1.0 - smoothstep(.4, .8, bump)));
+dispersionBlue -= .2 * edge;
+
+dispersionRed *= (u_shiftRed / 20.);
+dispersionBlue *= (u_shiftBlue / 20.);
+
+float blur = 0.;
+float rExtraBlur = 0.;
+float gExtraBlur = 0.;
+if (u_isImage == true) {
+  float softness = 0.05 * u_softness;
+  blur = softness + .5 * smoothstep(1., 10., u_repetition) * smoothstep(.0, 1., edge);
+  float smallCanvasT = 1.0 - smoothstep(100., 500., min(u_resolution.x, u_resolution.y));
+  blur += smallCanvasT * smoothstep(.0, 1., edge);
+  rExtraBlur = softness * (0.05 + .1 * (u_shiftRed / 20.) * bump);
+  gExtraBlur = softness * 0.05 / max(0.001, abs(1. - diagBLtoTR));
+} else {
+  blur = u_softness / 15. + .3 * contour;
+}
+
+vec3 w = vec3(thin_strip_1_width, thin_strip_2_width, wide_strip_ratio);
+w[1] -= .02 * smoothstep(.0, 1., edge + bump);
+float stripe_r = fract(direction + dispersionRed);
+float r = getColorChanges(color1.r, color2.r, stripe_r, w, blur + fwidth(stripe_r) + rExtraBlur, bump, u_colorTint.r);
+float stripe_g = fract(direction);
+float g = getColorChanges(color1.g, color2.g, stripe_g, w, blur + fwidth(stripe_g) + gExtraBlur, bump, u_colorTint.g);
+float stripe_b = fract(direction - dispersionBlue);
+float b = getColorChanges(color1.b, color2.b, stripe_b, w, blur + fwidth(stripe_b), bump, u_colorTint.b);
+
+color = vec3(r, g, b);
+color *= opacity;
+
+vec3 bgColor = u_colorBack.rgb * u_colorBack.a;
+color = color + bgColor * (1. - opacity);
+opacity = opacity + u_colorBack.a * (1. - opacity);
+
+${ZIA_METAL_GRAIN}
+
+fragColor = vec4(color, opacity);
+}
+`;
+// Paper Shaders' sizing vertex shader (vertex-shader.ts @ 0.0.80), as metal-fx vendors it.
+const ZIA_METAL_VERT = /* glsl */ `#version 300 es
+precision mediump float;
+
+layout(location = 0) in vec4 a_position;
+
+uniform vec2 u_resolution;
+uniform float u_pixelRatio;
+uniform float u_imageAspectRatio;
+uniform float u_originX;
+uniform float u_originY;
+uniform float u_worldWidth;
+uniform float u_worldHeight;
+uniform float u_fit;
+uniform float u_scale;
+uniform float u_rotation;
+uniform float u_offsetX;
+uniform float u_offsetY;
+
+out vec2 v_objectUV;
+out vec2 v_objectBoxSize;
+out vec2 v_responsiveUV;
+out vec2 v_responsiveBoxGivenSize;
+out vec2 v_patternUV;
+out vec2 v_patternBoxSize;
+out vec2 v_imageUV;
+
+vec3 getBoxSize(float boxRatio, vec2 givenBoxSize) {
+vec2 box = vec2(0.);
+// fit = none
+box.x = boxRatio * min(givenBoxSize.x / boxRatio, givenBoxSize.y);
+float noFitBoxWidth = box.x;
+if (u_fit == 1.) { // fit = contain
+  box.x = boxRatio * min(u_resolution.x / boxRatio, u_resolution.y);
+} else if (u_fit == 2.) { // fit = cover
+  box.x = boxRatio * max(u_resolution.x / boxRatio, u_resolution.y);
+}
+box.y = box.x / boxRatio;
+return vec3(box, noFitBoxWidth);
+}
+
+void main() {
+gl_Position = a_position;
+
+vec2 uv = gl_Position.xy * .5;
+vec2 boxOrigin = vec2(.5 - u_originX, u_originY - .5);
+vec2 givenBoxSize = vec2(u_worldWidth, u_worldHeight);
+givenBoxSize = max(givenBoxSize, vec2(1.)) * u_pixelRatio;
+float r = u_rotation * 3.14159265358979323846 / 180.;
+mat2 graphicRotation = mat2(cos(r), sin(r), -sin(r), cos(r));
+vec2 graphicOffset = vec2(-u_offsetX, u_offsetY);
+
+
+// ===================================================
+
+float fixedRatio = 1.;
+vec2 fixedRatioBoxGivenSize = vec2(
+(u_worldWidth == 0.) ? u_resolution.x : givenBoxSize.x,
+(u_worldHeight == 0.) ? u_resolution.y : givenBoxSize.y
+);
+
+v_objectBoxSize = getBoxSize(fixedRatio, fixedRatioBoxGivenSize).xy;
+vec2 objectWorldScale = u_resolution.xy / v_objectBoxSize;
+
+v_objectUV = uv;
+v_objectUV *= objectWorldScale;
+v_objectUV += boxOrigin * (objectWorldScale - 1.);
+v_objectUV += graphicOffset;
+v_objectUV /= u_scale;
+v_objectUV = graphicRotation * v_objectUV;
+
+// ===================================================
+
+v_responsiveBoxGivenSize = vec2(
+(u_worldWidth == 0.) ? u_resolution.x : givenBoxSize.x,
+(u_worldHeight == 0.) ? u_resolution.y : givenBoxSize.y
+);
+float responsiveRatio = v_responsiveBoxGivenSize.x / v_responsiveBoxGivenSize.y;
+vec2 responsiveBoxSize = getBoxSize(responsiveRatio, v_responsiveBoxGivenSize).xy;
+vec2 responsiveBoxScale = u_resolution.xy / responsiveBoxSize;
+
+v_responsiveUV = uv;
+v_responsiveUV *= responsiveBoxScale;
+v_responsiveUV += boxOrigin * (responsiveBoxScale - 1.);
+v_responsiveUV += graphicOffset;
+v_responsiveUV /= u_scale;
+v_responsiveUV.x *= responsiveRatio;
+v_responsiveUV = graphicRotation * v_responsiveUV;
+v_responsiveUV.x /= responsiveRatio;
+
+// ===================================================
+
+float patternBoxRatio = givenBoxSize.x / givenBoxSize.y;
+vec2 patternBoxGivenSize = vec2(
+(u_worldWidth == 0.) ? u_resolution.x : givenBoxSize.x,
+(u_worldHeight == 0.) ? u_resolution.y : givenBoxSize.y
+);
+patternBoxRatio = patternBoxGivenSize.x / patternBoxGivenSize.y;
+
+vec3 boxSizeData = getBoxSize(patternBoxRatio, patternBoxGivenSize);
+v_patternBoxSize = boxSizeData.xy;
+float patternBoxNoFitBoxWidth = boxSizeData.z;
+vec2 patternBoxScale = u_resolution.xy / v_patternBoxSize;
+
+v_patternUV = uv;
+v_patternUV += graphicOffset / patternBoxScale;
+v_patternUV += boxOrigin;
+v_patternUV -= boxOrigin / patternBoxScale;
+v_patternUV *= u_resolution.xy;
+v_patternUV /= u_pixelRatio;
+if (u_fit > 0.) {
+  v_patternUV *= (patternBoxNoFitBoxWidth / v_patternBoxSize.x);
+}
+v_patternUV /= u_scale;
+v_patternUV = graphicRotation * v_patternUV;
+v_patternUV += boxOrigin / patternBoxScale;
+v_patternUV -= boxOrigin;
+// x100 is a default multiplier between vertex and fragmant shaders
+// we use it to avoid UV presision issues
+v_patternUV *= .01;
+
+// ===================================================
+
+vec2 imageBoxSize;
+if (u_fit == 1.) { // contain
+  imageBoxSize.x = min(u_resolution.x / u_imageAspectRatio, u_resolution.y) * u_imageAspectRatio;
+} else if (u_fit == 2.) { // cover
+  imageBoxSize.x = max(u_resolution.x / u_imageAspectRatio, u_resolution.y) * u_imageAspectRatio;
+} else {
+  imageBoxSize.x = min(10.0, 10.0 / u_imageAspectRatio * u_imageAspectRatio);
+}
+imageBoxSize.y = imageBoxSize.x / u_imageAspectRatio;
+vec2 imageBoxScale = u_resolution.xy / imageBoxSize;
+
+v_imageUV = uv;
+v_imageUV *= imageBoxScale;
+v_imageUV += boxOrigin * (imageBoxScale - 1.);
+v_imageUV += graphicOffset;
+v_imageUV /= u_scale;
+v_imageUV.x *= u_imageAspectRatio;
+v_imageUV = graphicRotation * v_imageUV;
+v_imageUV.x /= u_imageAspectRatio;
+
+v_imageUV += .5;
+v_imageUV.y = 1. - v_imageUV.y;
+}`;
+
+// (Paper's defaults, then the silver preset's dark tuning; its light one is
+// ZIA_METAL_LIGHT)
+const ZIA_METAL_PRESET = {
+  colorBack: "#00000000",
+  colorTint: "#ffffff66",
+  repetition: 1.5,
+  softness: 0.05,
+  shiftRed: 0.3,
+  shiftBlue: 0.3,
+  distortion: 0.1,
+  contour: 0.4,
+  angle: 90,
+  shape: 0,
+  scale: 1,
+  rotation: 0,
+  offsetX: 0,
+  offsetY: 0,
+  originX: 0.5,
+  originY: 0.5,
+  worldWidth: 0,
+  worldHeight: 0,
+  fit: 1,
+  shaderOpacity: 0.88,
+};
+const ZIA_METAL_LIGHT = { colorTint: "#ffffff40", shaderOpacity: 1 };
+const ZIA_METAL_SIZE = 256;
+const ziaMetalSurfaces = new Set();
+let ziaMetalGL = null;
+let ziaMetalFailed = false;
+let ziaMetalFrame = 0;
+
+function ziaMetalHex(hex) {
+  const e = hex.replace("#", "");
+  const a = e.length >= 8 ? parseInt(e.slice(6, 8), 16) / 255 : 1;
+  return [parseInt(e.slice(0, 2), 16) / 255, parseInt(e.slice(2, 4), 16) / 255, parseInt(e.slice(4, 6), 16) / 255, a];
+}
+
+function ziaMetalSetup() {
+  if (ziaMetalGL || ziaMetalFailed) {
+    return ziaMetalGL;
+  }
+  try {
+    const canvas = document.createElementNS(XHTML_NS, "canvas");
+    canvas.width = ZIA_METAL_SIZE;
+    canvas.height = ZIA_METAL_SIZE;
+    const gl = canvas.getContext("webgl2", { alpha: true, premultipliedAlpha: true, antialias: false });
+    if (!gl) {
+      throw new Error("no WebGL2");
+    }
+    const compile = (type, src) => {
+      const shader = gl.createShader(type);
+      gl.shaderSource(shader, src);
+      gl.compileShader(shader);
+      if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+        throw new Error(gl.getShaderInfoLog(shader) || "shader");
+      }
+      return shader;
+    };
+    const program = gl.createProgram();
+    gl.attachShader(program, compile(gl.VERTEX_SHADER, ZIA_METAL_VERT));
+    gl.attachShader(program, compile(gl.FRAGMENT_SHADER, ZIA_METAL_FRAG));
+    gl.linkProgram(program);
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+      throw new Error(gl.getProgramInfoLog(program) || "program");
+    }
+    gl.useProgram(program);
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, -1, 1, 1, -1, 1, 1]), gl.STATIC_DRAW);
+    const position = gl.getAttribLocation(program, "a_position");
+    gl.enableVertexAttribArray(position);
+    gl.vertexAttribPointer(position, 2, gl.FLOAT, false, 0, 0);
+    // (the shader samples an image it isn't given here: a 1px stand-in)
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, gl.createTexture());
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([0, 0, 0, 255]));
+    const u = (name) => gl.getUniformLocation(program, name);
+    const p = ZIA_METAL_PRESET;
+    gl.uniform1i(u("u_image"), 0);
+    gl.uniform4fv(u("u_colorBack"), ziaMetalHex(p.colorBack));
+    gl.uniform4fv(u("u_colorTint"), ziaMetalHex(p.colorTint));
+    for (const key of ["repetition", "softness", "shiftRed", "shiftBlue", "distortion", "contour", "angle", "shape", "originX", "originY", "worldWidth", "worldHeight", "fit", "scale", "rotation", "offsetX", "offsetY"]) {
+      gl.uniform1f(u(`u_${key}`), p[key]);
+    }
+    gl.uniform1i(u("u_isImage"), 0);
+    gl.uniform1f(u("u_imageAspectRatio"), 1);
+    gl.uniform1f(u("u_pixelRatio"), 1);
+    canvas.addEventListener("webglcontextlost", (event) => {
+      event.preventDefault();
+      ziaMetalGL = null;
+    });
+    ziaMetalGL = { canvas, gl, resolution: u("u_resolution"), time: u("u_time"), tint: u("u_colorTint") };
+  } catch (err) {
+    ziaMetalFailed = true;
+    noteError("metal: set up", err);
+  }
+  return ziaMetalGL;
+}
+
+function ziaMetalDraw(s, now) {
+  const R = ziaMetalSetup();
+  const { width: w, height: h } = s.canvas;
+  if (!R || !w || !h) {
+    return;
+  }
+  const { gl } = R;
+  // its shape, at most ZIA_METAL_SIZE on its longer side; a band is a strip
+  // through a render a sixth as tall as it's wide
+  const k = ZIA_METAL_SIZE / Math.max(w, s.band ? 0 : h, 1);
+  const vw = Math.max(1, Math.round(Math.min(w * k, ZIA_METAL_SIZE)));
+  const vh = s.band ? Math.round(vw / 6) : Math.max(1, Math.round(Math.min(h * k, ZIA_METAL_SIZE)));
+  gl.viewport(0, 0, vw, vh);
+  gl.clearColor(0, 0, 0, 0);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  const mode = s.light ? ZIA_METAL_LIGHT : ZIA_METAL_PRESET;
+  gl.uniform4fv(R.tint, ziaMetalHex(mode.colorTint));
+  gl.uniform2f(R.resolution, vw, vh);
+  gl.uniform1f(R.time, ((now - s.t0) / 1000) * s.speed);
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+  const sh = s.band ? Math.max(1, Math.round(vh / 12)) : vh;
+  const sy = R.canvas.height - vh + Math.round((vh - sh) / 2);
+  s.ctx.clearRect(0, 0, w, h);
+  s.ctx.globalAlpha = mode.shaderOpacity;
+  s.ctx.drawImage(R.canvas, 0, sy, vw, sh, 0, 0, w, h);
+}
+
+function ziaMetalTick(now) {
+  ziaMetalFrame = 0;
+  const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
+  for (const s of ziaMetalSurfaces) {
+    if (!s.canvas.isConnected) {
+      continue;
+    }
+    if (now >= s.next) {
+      ziaMetalDraw(s, now);
+      s.next = now + s.every;
+      s.drawn = true;
+    }
+  }
+  const moving = [...ziaMetalSurfaces].some((s) => !reduced || !s.drawn);
+  if (moving && !document.hidden && !ziaMetalFailed) {
+    ziaMetalFrame = requestAnimationFrame(ziaMetalTick);
+  }
+}
+
+function ziaMetalWake() {
+  if (!ziaMetalFrame && ziaMetalSurfaces.size) {
+    ziaMetalFrame = requestAnimationFrame(ziaMetalTick);
+  }
+}
+
+function ziaMetalSurface(canvas, { speed = 1, every = 66, band = false, light = false } = {}) {
+  const ctx = canvas.getContext("2d");
+  const s = { canvas, ctx, speed, every, band, light, t0: performance.now() - Math.random() * 60000, next: 0, drawn: false };
+  if (ctx) {
+    ziaMetalSurfaces.add(s);
+    ziaMetalWake();
+  }
+  return {
+    setLight(on) {
+      s.light = !!on;
+      s.next = 0;
+      s.drawn = false;
+      ziaMetalWake();
+    },
+    destroy() {
+      ziaMetalSurfaces.delete(s);
+    },
+  };
+}
+
+document.addEventListener("visibilitychange", ziaMetalWake);
+  // ---------- ziaImgFx: Ultra's pixel-mosaic loader (the hover card's page preview)
+  /*
+   * A framework-free port of img-fx 0.5.1 (https://libraries.dev; npm
+   * "img-fx", the Libraries.dev "Image" loader by Jakub Antalik, a React
+   * component on three.js) to raw WebGL2 (WebGL1 fallback), no three.js.
+   * The GLSL, the presets (both tunings), the palette, the engine constants
+   * and the reveal / hide pipeline are copied from the package's
+   * dist/index.es.js; see NOTES.md for what was ported and what changed.
+   *
+   * MIT License
+   *
+   * Copyright (c) 2026 Jakub Antalik
+   *
+   * Permission is hereby granted, free of charge, to any person obtaining a copy
+   * of this software and associated documentation files (the "Software"), to deal
+   * in the Software without restriction, including without limitation the rights
+   * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+   * copies of the Software, and to permit persons to whom the Software is
+   * furnished to do so, subject to the following conditions:
+   *
+   * The above copyright notice and this permission notice shall be included in all
+   * copies or substantial portions of the Software.
+   *
+   * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+   * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+   * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+   * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+   * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+   * SOFTWARE.
+   *
+   * ziaImgFx(host, { preset, strength, dark, radius, palette, cardBg, minChurnMs, revealSeconds })
+   *   -> { reveal(source, { onDone }), hide(), setDark(dark), destroy(), element }
+   *
+   * revealSeconds: the dissolve's length in place of the preset's (3s for
+   * pixels-organic), its parts kept in proportion: a hover card's preview
+   * wants it quicker.
+   *
+   * palette: optional CSS colours (a few) that re-tint the mosaic's colour
+   * field in place of the preset's own, fed to the shader's seven colour
+   * uniforms as the package's colors override (see ziaImgRetint).
+   *
+   * The loader churns at once. reveal() snapshots a canvas, ImageBitmap or
+   * loaded <img> and dissolves into it as the package's
+   * triggerReveal({ hold: "manual" }) does (object-fit: cover), then holds it;
+   * hide() fades back to the churn as triggerHide() does. A host that can't
+   * hold children (canvas, img, video...) gets the loader as its next sibling,
+   * laid over its box; any other host gets it appended inside, filling it.
+   */
+
+  const ZIA_IMG_NS = "http://www.w3.org/1999/xhtml";
+
+  // The presets, verbatim from the package (dist: mt / vt / xt)
+  const ZIA_IMG_PRESETS = {
+    "pixels-organic": {
+      name: "pixels-organic",
+      modes: {
+        dark: {
+          theme: "dark",
+          effectIndex: 22,
+          colors: ["#0f0f0f", "#4a4949", "#b9b9b9", "#0f0f0f", "#d8d8d8", "#0f0f0f", "#2f2f2f"],
+          alphas: [1, 1, 1, 1, 1, 1, 1],
+          cardBg: "#0f0f0f",
+          dotMode: 1,
+          pixelConfig: {
+            cellSize: 0.22,
+            gap: 0.14,
+            dotOpacity: 0.68,
+            dotSize: 0.8,
+            dotSoftness: 0.1,
+            hlScale: 0.8,
+            fillOpacity: 0.44,
+            edgeFade: 24,
+            fadeStr: 1
+          },
+          dotConfig: {
+            cellSize: 0.58,
+            gap: 0,
+            dotOpacity: 1,
+            dotSize: 0.22,
+            dotSoftness: 0.1,
+            hlScale: 0.26,
+            fillOpacity: 0,
+            edgeFade: 34,
+            fadeStr: 0.34
+          },
+          direction: 0,
+          speed: 0.3,
+          intensity: 1,
+          scale: 1,
+          softness: 0.76,
+          distortion: 0.3,
+          complexity: 0.2,
+          shape: 0.52,
+          blur: 1,
+          highlight: 0.2,
+          vignette: 0.26,
+          vigOpacity: 1,
+          shaderOpacity: 1,
+          revealConfig: {
+            duration: 3,
+            easing: "easeOutCubic",
+            maskShape: "shaderColor4",
+            softness: 0.5,
+            blur: 0,
+            pixDuration: 2.65,
+            pixEasing: "easeOutCubic",
+            dotDuration: 2.05,
+            dotEasing: "easeOutCubic"
+          },
+          effect: "Chromium Flow"
+        },
+        light: {
+          theme: "light",
+          effectIndex: 22,
+          colors: ["#e3e3e3", "#ffffff", "#f5f5f5", "#f5f5f5", "#080808", "#f5f5f5", "#f5f5f5"],
+          alphas: [1, 1, 1, 1, 1, 1, 1],
+          cardBg: "#f5f5f5",
+          dotMode: 1,
+          pixelConfig: {
+            cellSize: 0.22,
+            gap: 0.14,
+            dotOpacity: 0.68,
+            dotSize: 0.8,
+            dotSoftness: 0.1,
+            hlScale: 0.8,
+            fillOpacity: 0.18,
+            edgeFade: 20,
+            fadeStr: 1
+          },
+          dotConfig: {
+            cellSize: 0.58,
+            gap: 0,
+            dotOpacity: 1,
+            dotSize: 0.22,
+            dotSoftness: 0.1,
+            hlScale: 0.26,
+            fillOpacity: 0,
+            edgeFade: 34,
+            fadeStr: 0.34
+          },
+          direction: 25,
+          speed: 0.3,
+          intensity: 0.85,
+          scale: 1,
+          softness: 0.76,
+          distortion: 0.3,
+          complexity: 0.2,
+          shape: 0.52,
+          blur: 1,
+          highlight: 0.7,
+          vignette: 0,
+          vigOpacity: 0,
+          shaderOpacity: 1,
+          revealConfig: {
+            duration: 3,
+            easing: "easeOutCubic",
+            maskShape: "shaderColor4",
+            softness: 0.5,
+            blur: 0,
+            pixDuration: 2.55,
+            pixEasing: "easeOutCubic",
+            dotDuration: 2.05,
+            dotEasing: "easeOutCubic"
+          },
+          effect: "Chromium Flow"
+        }
+      }
+    },
+    "pixels-mechanic": {
+      name: "pixels-mechanic",
+      modes: {
+        dark: {
+          theme: "dark",
+          effectIndex: 11,
+          colors: ["#949494", "#2d2d2d", "#333333", "#3a3a3a", "#0b0b0b", "#060606", "#2f2f2f"],
+          alphas: [1, 1, 1, 1, 1, 1, 1],
+          cardBg: "#0f0f0f",
+          dotMode: 1,
+          pixelConfig: {
+            cellSize: 0.22,
+            gap: 0.14,
+            dotOpacity: 0.68,
+            dotSize: 0.8,
+            dotSoftness: 0.1,
+            hlScale: 0.8,
+            fillOpacity: 0.44,
+            edgeFade: 24,
+            fadeStr: 1
+          },
+          dotConfig: {
+            cellSize: 0.58,
+            gap: 0,
+            dotOpacity: 1,
+            dotSize: 0.22,
+            dotSoftness: 0.1,
+            hlScale: 0.26,
+            fillOpacity: 0,
+            edgeFade: 34,
+            fadeStr: 0.34
+          },
+          direction: 0,
+          speed: 0.7,
+          intensity: 1,
+          scale: 1.4,
+          softness: 0.76,
+          distortion: 0.3,
+          flicker: 0.5,
+          complexity: 0.2,
+          shape: 0.52,
+          blur: 1,
+          highlight: 0.32,
+          vignette: 0.26,
+          vigOpacity: 1,
+          shaderOpacity: 1,
+          revealConfig: {
+            duration: 3,
+            easing: "easeOutCubic",
+            maskShape: "shaderColor4",
+            softness: 0.5,
+            blur: 0,
+            pixDuration: 2.65,
+            pixEasing: "easeOutCubic",
+            dotDuration: 2.05,
+            dotEasing: "easeOutCubic"
+          },
+          effect: "Nebula"
+        },
+        light: {
+          theme: "light",
+          effectIndex: 11,
+          colors: ["#e0e0e0", "#fdfdfd", "#f2f2f2", "#0a0a0a", "#dcdcdc", "#f5f5f5", "#f5f5f5"],
+          alphas: [1, 1, 1, 1, 1, 1, 1],
+          cardBg: "#f5f5f5",
+          dotMode: 1,
+          pixelConfig: {
+            cellSize: 0.22,
+            gap: 0.14,
+            dotOpacity: 0.68,
+            dotSize: 0.8,
+            dotSoftness: 0.1,
+            hlScale: 0.8,
+            fillOpacity: 0.18,
+            edgeFade: 20,
+            fadeStr: 1
+          },
+          dotConfig: {
+            cellSize: 0.58,
+            gap: 0,
+            dotOpacity: 1,
+            dotSize: 0.22,
+            dotSoftness: 0.1,
+            hlScale: 0.26,
+            fillOpacity: 0,
+            edgeFade: 34,
+            fadeStr: 0.34
+          },
+          direction: 25,
+          speed: 0.55,
+          intensity: 0.85,
+          scale: 0.9,
+          softness: 0.76,
+          distortion: 0.3,
+          flicker: 0.5,
+          complexity: 0.2,
+          shape: 0.52,
+          blur: 1,
+          highlight: 0.92,
+          vignette: 0,
+          vigOpacity: 0,
+          shaderOpacity: 1,
+          revealConfig: {
+            duration: 3,
+            easing: "easeOutCubic",
+            maskShape: "shaderColor3",
+            softness: 0.5,
+            blur: 0,
+            pixDuration: 2.6,
+            pixEasing: "easeOutCubic",
+            dotDuration: 2.05,
+            dotEasing: "easeOutCubic"
+          },
+          effect: "Nebula"
+        }
+      }
+    },
+    "sweep-gradient": {
+      name: "sweep-gradient",
+      modes: {
+        dark: {
+          theme: "dark",
+          effectIndex: 25,
+          colors: ["#0f0f0f", "#0f0f0f", "#282828", "#3a3a3a", "#525252", "#0f0f0f", "#0f0f0f"],
+          alphas: [1, 1, 1, 1, 1, 1, 1],
+          cardBg: "#0f0f0f",
+          dotMode: 1,
+          pixelConfig: {
+            cellSize: 0.22,
+            gap: 0.14,
+            dotOpacity: 0.68,
+            dotSize: 0.8,
+            dotSoftness: 0.1,
+            hlScale: 0.8,
+            fillOpacity: 0.44,
+            edgeFade: 24,
+            fadeStr: 1
+          },
+          dotConfig: {
+            cellSize: 0.58,
+            gap: 0,
+            dotOpacity: 1,
+            dotSize: 0.22,
+            dotSoftness: 0.1,
+            hlScale: 0.26,
+            fillOpacity: 0,
+            edgeFade: 34,
+            fadeStr: 0.34
+          },
+          direction: 0,
+          speed: 2.65,
+          intensity: 1,
+          scale: 1,
+          softness: 0.76,
+          distortion: 0.3,
+          flicker: 0.5,
+          complexity: 0.2,
+          shape: 0.52,
+          blur: 1,
+          highlight: 0.32,
+          vignette: 0.26,
+          vigOpacity: 1,
+          shaderOpacity: 1,
+          sweepEase: 1,
+          revealConfig: {
+            duration: 3,
+            easing: "easeOutCubic",
+            maskShape: "gradientSweep",
+            softness: 0.5,
+            blur: 0,
+            pixDuration: 2.65,
+            pixEasing: "easeOutCubic",
+            dotDuration: 2.05,
+            dotEasing: "easeOutCubic"
+          },
+          effect: "Gradient Sweep"
+        },
+        light: {
+          theme: "light",
+          effectIndex: 25,
+          colors: ["#f5f5f5", "#f5f5f5", "#ededed", "#eaeaea", "#d2d2d2", "#f5f5f5", "#f5f5f5"],
+          alphas: [1, 1, 1, 1, 1, 1, 1],
+          cardBg: "#f5f5f5",
+          dotMode: 1,
+          pixelConfig: {
+            cellSize: 0.22,
+            gap: 0.14,
+            dotOpacity: 0.68,
+            dotSize: 0.8,
+            dotSoftness: 0.1,
+            hlScale: 0.8,
+            fillOpacity: 0.18,
+            edgeFade: 20,
+            fadeStr: 1
+          },
+          dotConfig: {
+            cellSize: 0.58,
+            gap: 0,
+            dotOpacity: 1,
+            dotSize: 0.22,
+            dotSoftness: 0.1,
+            hlScale: 0.26,
+            fillOpacity: 0,
+            edgeFade: 34,
+            fadeStr: 0.34
+          },
+          direction: 0,
+          speed: 2.65,
+          intensity: 0.85,
+          scale: 1,
+          softness: 0.76,
+          distortion: 0.3,
+          flicker: 0.5,
+          complexity: 0.2,
+          shape: 0.52,
+          blur: 1,
+          highlight: 0.92,
+          vignette: 0,
+          vigOpacity: 0,
+          shaderOpacity: 1,
+          sweepEase: 1,
+          revealConfig: {
+            duration: 3,
+            easing: "easeOutCubic",
+            maskShape: "gradientSweep",
+            softness: 0.5,
+            blur: 0,
+            pixDuration: 2.6,
+            pixEasing: "easeOutCubic",
+            dotDuration: 2.05,
+            dotEasing: "easeOutCubic"
+          },
+          effect: "Gradient Sweep"
+        }
+      }
+    },
+  };
+
+  // The shaders, verbatim from the package (dist: bt / _t)
+  const ZIA_IMG_VERT = /* glsl */ `
+  void main() { gl_Position = vec4(position.xy, 0.0, 1.0); }
+`;
+  const ZIA_IMG_FRAG = /* glsl */ `
+  uniform vec2 u_resolution;
+  uniform float u_dpr;
+  uniform float u_time;
+  uniform vec3 u_color1, u_color2, u_color3, u_color4, u_color5, u_color6, u_color7, u_cardBg;
+  uniform float u_alpha1, u_alpha2, u_alpha3, u_alpha4, u_alpha5, u_alpha6, u_alpha7;
+  uniform float u_speed, u_intensity, u_scale, u_direction;
+  uniform float u_softness, u_distortion, u_complexity, u_shape, u_flicker;
+  uniform float u_vignette, u_vigOpacity, u_blur, u_highlight, u_shaderOpacity;
+  uniform float u_cellSize, u_gap, u_dotSize, u_dotSoftness, u_dotOpacity, u_hlScale, u_fillOpacity, u_edgeFade, u_fadeStr;
+  uniform float u_dotMode;
+  uniform int u_effect;
+  uniform int u_sweepEase;
+
+  // Reference card edge length (CSS px) at which the original preset cellSize
+  // gives the canonical cell count. Cell PIXEL size stays constant across card
+  // sizes by scaling gridSize proportionally to (currentCssDim / REF_DIM).
+  const float REF_DIM = 320.0;
+
+  /** Anisotropic cell count: returns the number of cells along x and y so that
+   *  each cell stays SQUARE in screen space regardless of the card's aspect
+   *  ratio. A 600×300 card gets twice as many cells horizontally as vertically;
+   *  cells stay the same physical size as on a 300×300 card. */
+  vec2 gridCounts(float baseCount) {
+    vec2 cssRes = u_resolution / max(u_dpr, 0.0001);
+    return max(vec2(2.0), floor(baseCount * cssRes / REF_DIM));
+  }
+
+  vec3 mod289(vec3 x) { return x - floor(x * (1.0/289.0)) * 289.0; }
+  vec2 mod289v2(vec2 x) { return x - floor(x * (1.0/289.0)) * 289.0; }
+  vec3 permute(vec3 x) { return mod289((x * 34.0 + 1.0) * x); }
+
+  float snoise(vec2 v) {
+    const vec4 C = vec4(0.211324865405187, 0.366025403784439, -0.577350269189626, 0.024390243902439);
+    vec2 i = floor(v + dot(v, C.yy));
+    vec2 x0 = v - i + dot(i, C.xx);
+    vec2 i1 = (x0.x > x0.y) ? vec2(1.0, 0.0) : vec2(0.0, 1.0);
+    vec4 x12 = x0.xyxy + C.xxzz;
+    x12.xy -= i1;
+    i = mod289v2(i);
+    vec3 p = permute(permute(i.y + vec3(0.0, i1.y, 1.0)) + i.x + vec3(0.0, i1.x, 1.0));
+    vec3 m = max(0.5 - vec3(dot(x0,x0), dot(x12.xy,x12.xy), dot(x12.zw,x12.zw)), 0.0);
+    m = m * m; m = m * m;
+    vec3 x_ = 2.0 * fract(p * C.www) - 1.0;
+    vec3 h = abs(x_) - 0.5;
+    vec3 ox = floor(x_ + 0.5);
+    vec3 a0 = x_ - ox;
+    m *= 1.79284291400159 - 0.85373472095314 * (a0*a0 + h*h);
+    vec3 g;
+    g.x = a0.x * x0.x + h.x * x0.y;
+    g.yz = a0.yz * x12.xz + h.yz * x12.yw;
+    return 130.0 * dot(m, g);
+  }
+
+  float fbm(vec2 p, float oct) {
+    float val = 0.0, amp = 0.5;
+    int n = int(oct);
+    for (int i = 0; i < 4; i++) {
+      if (i >= n) break;
+      val += amp * snoise(p);
+      p *= 2.0;
+      amp *= 0.5;
+    }
+    return val;
+  }
+
+  float nfbm(vec2 p) { return fbm(p, 2.0 + u_complexity * 2.0); }
+
+  vec3 palette(float t) {
+    t = clamp(t, 0.0, 1.0);
+    t = t * t * (3.0 - 2.0 * t);
+    float k = 64.0;
+    float w1 = u_alpha1 * exp(-k * t * t);
+    float w2 = u_alpha2 * exp(-k * (t - 0.25) * (t - 0.25));
+    float w3 = u_alpha3 * exp(-k * (t - 0.5)  * (t - 0.5));
+    float w4 = u_alpha4 * exp(-k * (t - 0.75) * (t - 0.75));
+    float w5 = u_alpha5 * exp(-k * (t - 1.0)  * (t - 1.0));
+    float total = w1 + w2 + w3 + w4 + w5 + 0.0001;
+    return (u_color1*w1 + u_color2*w2 + u_color3*w3 + u_color4*w4 + u_color5*w5) / total;
+  }
+
+  vec3 softBlend(float a, float b, float c) {
+    a = clamp(a, 0.0, 1.0); a *= a;
+    b = clamp(b, 0.0, 1.0); b *= b;
+    c = clamp(c, 0.0, 1.0); c *= c;
+    float d = clamp(a * 0.7 + c * 0.3, 0.0, 1.0); d *= d;
+    float e = clamp(b * 0.5 + c * 0.5, 0.0, 1.0); e *= e;
+    a *= u_alpha1; b *= u_alpha2; c *= u_alpha3; d *= u_alpha4; e *= u_alpha5;
+    float total = a + b + c + d + e;
+    float floorW = max(0.001 - total, 0.0);
+    vec3 fallback = (u_color1 + u_color2 + u_color3 + u_color4 + u_color5) * 0.2;
+    return (u_color1 * a + u_color2 * b + u_color3 * c + u_color4 * d + u_color5 * e + fallback * floorW) / (total + floorW);
+  }
+
+  vec2 warp(vec2 p, float t) {
+    float str = u_distortion * 2.0;
+    return vec2(
+      nfbm(p + vec2(t * 0.1, 0.0)),
+      nfbm(p + vec2(0.0, t * 0.12) + 5.0)
+    ) * str;
+  }
+
+  float sweepEase(float x) {
+    if (u_sweepEase == 1) return x * x * (3.0 - 2.0 * x);
+    if (u_sweepEase == 2) {
+      float p = 1.0 - x;
+      return 1.0 - p * p * p;
+    }
+    if (u_sweepEase == 3) {
+      return x < 0.5 ? 4.0 * x * x * x : 1.0 - pow(-2.0 * x + 2.0, 3.0) * 0.5;
+    }
+    if (u_sweepEase == 4) return 1.0 - pow(2.0, -10.0 * x) * (1.0 - x);
+    return x;
+  }
+
+  float blob(vec2 p, vec2 center, float radius) {
+    float r = radius * (0.5 + u_shape * 0.8);
+    float soft = 0.05 + u_softness * 0.4;
+    return smoothstep(r + soft, r - soft * 0.5, length(p - center));
+  }
+
+  vec3 computeEffect(vec2 uv, float aspect, float t, float dist, float soft, float cpx, float shp) {
+    vec2 p = (uv - 0.5) * u_scale;
+    p.x *= aspect;
+    p += vec2(cos(u_direction), sin(u_direction)) * t * 0.15;
+    vec3 col = vec3(0.0);
+
+    if (u_effect == 0) {
+      float val = sin(p.x * 3.0 + t) * 0.5 + 0.5;
+      val += sin(p.y * 2.0 + t * 0.7) * 0.3;
+      val += sin((p.x + p.y) * (1.0 + cpx * 3.0) - t * 0.5) * 0.2;
+      vec2 w = warp(p, t);
+      val += (w.x + w.y) * 0.15;
+      col = palette(clamp(val * u_intensity, 0.0, 1.0));
+
+    } else if (u_effect == 1) {
+      float freq = 3.0 + cpx * 8.0;
+      float val = 0.0;
+      val += sin(p.x * freq + t);
+      val += sin(p.y * freq + t * 1.3);
+      val += sin((p.x + p.y) * freq * 0.7 + t * 0.7);
+      val += sin(length(p) * freq * 0.8 - t * 1.5);
+      vec2 w = warp(p, t);
+      val += (w.x + w.y) * dist;
+      val = val * 0.2 * u_intensity + 0.5;
+      col = palette(clamp(val, 0.0, 1.0));
+
+    } else if (u_effect == 2) {
+      vec2 q = vec2(nfbm(p + t * 0.3), nfbm(p + vec2(5.2, 1.3) + t * 0.2));
+      float val = nfbm(p + q * (1.0 + dist * 3.0) + t * 0.1);
+      val = val * u_intensity * 0.5 + 0.5;
+      col = palette(clamp(val, 0.0, 1.0));
+
+    } else if (u_effect == 3) {
+      float d = length(p);
+      float val = sin(d * (3.0 + cpx * 6.0) - t * 2.0) * 0.5 + 0.5;
+      val *= exp(-d * (0.3 + shp * 1.0));
+      val += sin(atan(p.y, p.x) * (1.5 + cpx * 2.0) + t) * 0.15;
+      col = palette(clamp(val * u_intensity, 0.0, 1.0));
+
+    } else if (u_effect == 4) {
+      vec2 q = vec2(nfbm(p * (0.5 + shp * 0.6) + vec2(t * 0.12, t * 0.08)), nfbm(p * (0.5 + shp * 0.6) + vec2(t * 0.09, -t * 0.11)));
+      vec2 r = vec2(nfbm(p + q * (1.0 + dist * 2.0) + vec2(1.7, 9.2) + t * 0.06), nfbm(p + q * (1.0 + dist * 2.0) + vec2(8.3, 2.8) - t * 0.08));
+      float val = nfbm(p + r * 2.0);
+      float lo = -0.3 - soft * 0.5;
+      float hi = 0.5 + soft * 0.5;
+      val = smoothstep(lo, hi, val * u_intensity);
+      col = palette(val);
+
+    } else if (u_effect == 5) {
+      float n1 = nfbm(vec2(p.x * 0.5 + t * 0.15, p.y * (1.0 + cpx * 1.5)));
+      float n2 = nfbm(vec2(p.x * 0.3 - t * 0.1, p.y * (0.8 + cpx * 1.0) + 3.0));
+      float band = sin(p.y * 3.0 + n1 * (1.0 + dist * 2.0) + t * 0.3) * 0.5 + 0.5;
+      float shimmer = sin(p.y * 4.0 + n2 * 1.5 - t * 0.2) * 0.5 + 0.5;
+      float w1 = band * (0.5 + 0.5 * sin(p.x * 1.5 + t * 0.2 + n1));
+      float w2 = shimmer * (0.5 + 0.5 * cos(p.x * 1.0 - t * 0.15 + n2));
+      float w3 = nfbm(p * 0.5 + t * 0.05) * 0.5 + 0.5;
+      col = softBlend(w1 * u_intensity, w2 * u_intensity, w3 * 0.6 * u_intensity);
+
+    } else if (u_effect == 6) {
+      vec2 wp = warp(p * 1.2, t);
+      float blobR = 0.15 + shp * 0.2;
+      float b1 = blob(p, vec2(sin(t * 0.3) * 0.3, cos(t * 0.2) * 0.4) + wp * 0.2, blobR);
+      float b2 = blob(p, vec2(cos(t * 0.25) * 0.4, sin(t * 0.35) * 0.3 - 0.2) + wp * 0.15, blobR * 1.2);
+      float b3 = blob(p, vec2(-sin(t * 0.2) * 0.3, -cos(t * 0.3) * 0.35) + wp * 0.18, blobR);
+      float bg = nfbm(p * 0.5 + t * 0.05) * 0.3 + 0.15;
+      col = softBlend((b1 + bg * 0.5) * u_intensity, (b2 + bg * 0.3) * u_intensity, (b3 + bg * 0.4) * u_intensity);
+
+    } else if (u_effect == 7) {
+      float sz = 0.4 + shp * 0.6;
+      float sigma = sz * sz * 2.0;
+      vec2 a1 = vec2(-0.45 + sin(t * 0.07) * 0.06, 0.45 + cos(t * 0.09) * 0.05);
+      vec2 a2 = vec2(0.45 + cos(t * 0.08) * 0.06, 0.45 + sin(t * 0.06) * 0.05);
+      vec2 a3 = vec2(0.0 + sin(t * 0.05) * 0.1, 0.0 + cos(t * 0.07) * 0.1);
+      vec2 a4 = vec2(-0.4 + cos(t * 0.06) * 0.07, -0.3 + sin(t * 0.08) * 0.06);
+      vec2 a5 = vec2(0.4 + sin(t * 0.07) * 0.06, -0.4 + cos(t * 0.05) * 0.06);
+      float g1 = exp(-dot(p - a1, p - a1) / sigma);
+      float g2 = exp(-dot(p - a2, p - a2) / sigma);
+      float g3 = exp(-dot(p - a3, p - a3) / sigma);
+      float g4 = exp(-dot(p - a4, p - a4) / sigma);
+      float g5 = exp(-dot(p - a5, p - a5) / sigma);
+      float nudge = dist > 0.01 ? snoise(p * (0.5 + cpx) + t * 0.04) * dist * 0.08 : 0.0;
+      float w1 = (g1 + g4 + nudge) * u_intensity;
+      float w2 = (g2 + g5 + nudge) * u_intensity;
+      float w3 = (g3 + nudge) * u_intensity;
+      col = softBlend(w1, w2, w3);
+
+    } else if (u_effect == 8) {
+      vec2 w1 = vec2(nfbm(p * (0.7 + cpx * 0.5) + t * 0.1), nfbm(p * (0.7 + cpx * 0.5) + vec2(3.3, 7.7) + t * 0.08));
+      vec2 w2 = vec2(nfbm(p * 0.6 + w1 * (1.0 + dist) + t * 0.06), nfbm(p * 0.6 + w1 * (1.0 + dist) + vec2(1.7, 4.2) - t * 0.07));
+      float f1 = nfbm(p + w2 * 1.5);
+      float f2 = nfbm(p + w2 * 1.5 + vec2(4.1, 2.3));
+      float f3 = nfbm(p + w2 * 1.5 + vec2(7.5, 6.1));
+      col = softBlend((f1 * 0.5 + 0.5) * u_intensity, (f2 * 0.5 + 0.5) * u_intensity, (f3 * 0.5 + 0.5) * u_intensity);
+
+    } else if (u_effect == 9) {
+      vec2 sw = vec2(sin(p.y * 2.0 + t * 0.3) * 0.15 + snoise(p * 1.5 + t * 0.15) * dist * 0.3, cos(p.x * 1.8 + t * 0.25) * 0.15 + snoise(p * 1.5 + vec2(5.0, 0.0) + t * 0.12) * dist * 0.3);
+      vec2 wp = p + sw;
+      float caustic = (snoise(wp * (1.5 + cpx * 2.0) + t * 0.2) * 0.5 + 0.5) + (snoise(wp * (2.0 + cpx * 2.0) - t * 0.15) * 0.5 + 0.5) * 0.5;
+      caustic = caustic / 1.5;
+      float depth = nfbm(vec2(p.x * 0.3, p.y * 0.8) + t * 0.05) * 0.5 + 0.5;
+      col = softBlend(depth * u_intensity, (1.0 - depth) * u_intensity, caustic * u_intensity);
+
+    } else if (u_effect == 10) {
+      float angle = 0.6 + shp * 1.2;
+      float ca = cos(angle), sa = sin(angle);
+      vec2 rp = vec2(p.x * ca - p.y * sa, p.x * sa + p.y * ca);
+      float n1 = nfbm(rp * 0.8 + t * 0.12) * (1.0 + dist * 2.0);
+      float n2 = nfbm(rp * 0.6 + vec2(3.0, 0.0) + t * 0.1) * (1.0 + dist * 1.5);
+      float wave = sin(rp.x * (2.0 + cpx * 2.0) + n1 + t * 0.3);
+      float wave2 = sin(rp.x * (1.5 + cpx * 1.5) + n2 - t * 0.2);
+      float ribbon1 = exp(-2.0 * (rp.y - wave * 0.35) * (rp.y - wave * 0.35)) * u_intensity;
+      float ribbon2 = exp(-2.0 * (rp.y - 0.15 - wave2 * 0.3) * (rp.y - 0.15 - wave2 * 0.3)) * u_intensity;
+      float bg = nfbm(p * 0.4 + t * 0.03) * 0.5 + 0.5;
+      col = softBlend(ribbon1, ribbon2, bg * 0.5 * u_intensity);
+
+    } else if (u_effect == 11) {
+      vec2 q = vec2(nfbm(p * 0.5 + vec2(t * 0.05, 0.0)), nfbm(p * 0.5 + vec2(0.0, t * 0.07)));
+      vec2 r = vec2(nfbm(p * 0.6 + q * (1.0 + dist * 1.5) + vec2(1.7, 9.2) + t * 0.03), nfbm(p * 0.6 + q * (1.0 + dist * 1.5) + vec2(8.3, 2.8) + t * 0.04));
+      float f = nfbm(p + r * 1.5);
+      float f2 = nfbm(p * 0.7 + r + vec2(3.0, 7.0));
+      col = softBlend((f * 0.5 + 0.5) * u_intensity, (f2 * 0.5 + 0.5) * u_intensity, (nfbm(p * 0.4 - t * 0.02) * 0.5 + 0.5) * u_intensity);
+
+    } else if (u_effect == 12) {
+      vec2 w = warp(p * 0.5, t * 0.7);
+      float fold1 = sin(p.x * (1.5 + cpx * 2.0) + w.x * 1.5 + t * 0.2) * 0.5 + 0.5;
+      float fold2 = sin(p.y * (1.2 + cpx * 1.5) + w.y * 1.5 - t * 0.15) * 0.5 + 0.5;
+      float fold3 = sin((p.x - p.y) * (0.8 + cpx * 0.8) + (w.x + w.y) + t * 0.1) * 0.5 + 0.5;
+      col = softBlend(fold1 * u_intensity, fold2 * u_intensity, fold3 * 0.7 * u_intensity);
+
+    } else if (u_effect == 13) {
+      float spread = 0.25 + shp * 0.35;
+      vec2 w = warp(p, t * 0.5);
+      vec2 c1 = vec2(sin(t * 0.08) * spread, cos(t * 0.11) * spread) + w * 0.15;
+      vec2 c2 = vec2(cos(t * 0.09) * spread * 1.3, sin(t * 0.07) * spread) + w * 0.12;
+      vec2 c3 = vec2(-sin(t * 0.1) * spread, -cos(t * 0.08) * spread * 1.2) + w * 0.1;
+      float falloff = 0.3 + soft * 0.7;
+      float d1 = 1.0 - smoothstep(0.0, falloff, length(p - c1 + w * dist * 0.3));
+      float d2 = 1.0 - smoothstep(0.0, falloff, length(p - c2 + w * dist * 0.25));
+      float d3 = 1.0 - smoothstep(0.0, falloff, length(p - c3 + w * dist * 0.2));
+      float detail = nfbm(p * 2.0 + t * 0.05) * cpx * 0.3;
+      col = softBlend((d1 + detail) * u_intensity, (d2 + detail) * u_intensity, (d3 + detail) * u_intensity);
+
+    } else if (u_effect == 14) {
+      vec2 w = warp(p * 0.6, t * 0.6);
+      float angle = atan(p.y + w.y * dist, p.x + w.x * dist);
+      float radius = length(p);
+      float field1 = sin(angle * (2.0 + cpx * 4.0) + radius * (3.0 + cpx * 3.0) + t * 0.4 + nfbm(p + t * 0.1) * dist * 2.0) * 0.5 + 0.5;
+      float field2 = sin(angle * (1.5 + cpx * 2.5) - radius * 2.0 - t * 0.3 + nfbm(p * 0.6 + t * 0.08) * dist * 1.5) * 0.5 + 0.5;
+      float bg = nfbm(p * 0.3 + t * 0.03) * 0.5 + 0.5;
+      col = softBlend(field1 * u_intensity, field2 * u_intensity, bg * 0.5 * u_intensity);
+
+    } else if (u_effect == 15) {
+      vec2 drift = vec2(t * 0.06, t * 0.03);
+      float c1 = nfbm((p + drift) * (0.4 + cpx * 0.5)) * 0.5 + 0.5;
+      float c2 = nfbm((p + drift + vec2(3.7, 1.2)) * (0.35 + cpx * 0.4)) * 0.5 + 0.5;
+      float c3 = nfbm((p + drift + vec2(7.1, 4.5)) * (0.3 + cpx * 0.35)) * 0.5 + 0.5;
+      vec2 w = warp(p * 0.2, t * 0.4);
+      c1 += w.x * dist * 0.3;
+      c2 += w.y * dist * 0.25;
+      col = softBlend(c1 * u_intensity, c2 * u_intensity, c3 * u_intensity);
+
+    } else if (u_effect == 16) {
+      vec2 w = warp(vec2(p.x * 0.3, p.y * 0.6), t * 0.5);
+      float c1 = sin(p.x * (1.5 + cpx * 2.0) + w.x * (1.0 + dist * 2.0) + t * 0.15) * 0.5 + 0.5;
+      float c2 = sin(p.x * (1.0 + cpx * 1.5) + w.y * (1.0 + dist * 1.5) - t * 0.12 + 2.0) * 0.5 + 0.5;
+      float c3 = sin(p.x * (0.8 + cpx * 1.0) + (w.x + w.y) * 0.5 * (1.0 + dist) + t * 0.08 + 4.0) * 0.5 + 0.5;
+      float fade = nfbm(vec2(p.x * 0.3, p.y * 0.5) + t * 0.03) * 0.5 + 0.5;
+      col = softBlend(c1 * fade * u_intensity, c2 * fade * u_intensity, c3 * (1.0 - fade * 0.4) * u_intensity * 0.7);
+
+    } else if (u_effect == 17) {
+      vec2 w = warp(p * 0.8, t * 0.6);
+      vec2 w2 = warp(p * 0.5 + w * 0.4, t * 0.4);
+      float r1 = (snoise((p + w * dist * 0.5) * (1.5 + cpx * 2.0) + t * 0.1) * 0.5 + 0.5) * u_intensity;
+      float r2 = (snoise((p + w2 * dist * 0.4) * (1.2 + cpx * 1.5) + t * 0.08 + 3.0) * 0.5 + 0.5) * u_intensity;
+      float r3 = (snoise((p + (w + w2) * dist * 0.3) * (0.8 + cpx * 1.0) - t * 0.06 + 7.0) * 0.5 + 0.5) * u_intensity;
+      col = softBlend(r1, r2, r3);
+
+    } else if (u_effect == 18) {
+      vec2 w = warp(p * 0.5, t * 0.5);
+      float blobSize = 0.2 + shp * 0.3;
+      float total1 = 0.0, total2 = 0.0;
+      for (int i = 0; i < 5; i++) {
+        float fi = float(i);
+        vec2 c1 = vec2(sin(t * 0.1 + fi * 2.1) * 0.4, cos(t * 0.13 + fi * 1.7) * 0.35) + w * dist * 0.15;
+        vec2 c2 = vec2(cos(t * 0.12 + fi * 1.9) * 0.35, sin(t * 0.09 + fi * 2.3) * 0.4) + w * dist * 0.12;
+        total1 += blobSize * blobSize / (dot(p - c1, p - c1) + 0.02);
+        total2 += blobSize * blobSize / (dot(p - c2, p - c2) + 0.02);
+      }
+      total1 = clamp(total1 * 0.25, 0.0, 1.0);
+      total2 = clamp(total2 * 0.25, 0.0, 1.0);
+      float total3 = nfbm(p + w * dist * 0.3 + t * 0.05) * 0.5 + 0.5;
+      col = softBlend(total1 * u_intensity, total2 * u_intensity, total3 * 0.7 * u_intensity);
+
+    } else if (u_effect == 19) {
+      vec2 w = warp(p * 0.4, t * 0.4);
+      float angle = atan(p.y, p.x);
+      float radius = length(p);
+      float s1 = sin(angle * (1.5 + cpx * 2.0) + radius * (3.0 + cpx * 3.0) + t * 0.3 + w.x * dist * 1.5) * 0.5 + 0.5;
+      float s2 = sin(angle * (1.2 + cpx * 1.5) - radius * (2.5 + cpx * 2.5) - t * 0.25 + w.y * dist * 1.5 + 1.5) * 0.5 + 0.5;
+      float s3 = sin((angle + 3.14) * (0.8 + cpx) + radius * (2.0 + cpx * 2.0) + t * 0.15 + (w.x + w.y) * dist) * 0.5 + 0.5;
+      float fade = exp(-radius * (0.5 - shp * 0.3));
+      col = softBlend(s1 * fade * u_intensity, s2 * fade * u_intensity, s3 * fade * 0.7 * u_intensity);
+
+    } else if (u_effect == 20) {
+      vec2 w = warp(p * 0.5, t * 0.4);
+      vec2 wp = p + w * (0.4 + dist * 0.6);
+      float scale = 0.6 + cpx * 0.8;
+      float h  = nfbm(wp * scale + t * 0.08);
+      float eps = 0.06;
+      float hx = nfbm((wp + vec2(eps, 0.0)) * scale + t * 0.08) - h;
+      float hy = nfbm((wp + vec2(0.0, eps)) * scale + t * 0.08) - h;
+      vec3 n = normalize(vec3(-hx * 6.0, -hy * 6.0, 1.0));
+      vec3 lightDir = normalize(vec3(0.55, 0.65, 0.8));
+      float light = max(dot(n, lightDir), 0.0);
+      float spec = pow(light, 6.0 + shp * 26.0);
+      float diffuse = light * 0.6 + 0.35;
+      float fres = pow(1.0 - max(n.z, 0.0), 2.0);
+      float w1 = (diffuse + spec * 0.5) * u_intensity;
+      float w2 = (h * 0.5 + 0.5 + spec * 0.3 + fres * 0.3) * u_intensity;
+      float w3 = (spec * 1.4 + fres * 0.5) * u_intensity;
+      col = softBlend(w1, w2, w3);
+
+    } else if (u_effect == 21) {
+      vec2 w = warp(p * 0.4, t * 0.3);
+      float angle = 0.2 + shp * 1.3;
+      float ca = cos(angle), sa = sin(angle);
+      vec2 rp = vec2(p.x * ca - p.y * sa, p.x * sa + p.y * ca);
+      float band = sin(rp.y * (3.0 + cpx * 5.0) + w.x * (1.0 + dist * 2.5) + t * 0.35);
+      float ridge = 1.0 - abs(band);
+      ridge = pow(ridge, 5.0 + shp * 10.0);
+      float band2 = sin(rp.y * (2.0 + cpx * 3.0) + w.y * (0.8 + dist * 2.0) - t * 0.22 + 1.4);
+      float ridge2 = 1.0 - abs(band2);
+      ridge2 = pow(ridge2, 3.0 + shp * 8.0);
+      float bg = nfbm(p * 0.45 + t * 0.05) * 0.5 + 0.5;
+      float w1 = (ridge * 1.4 + bg * 0.25) * u_intensity;
+      float w2 = (ridge2 * 1.0 + bg * 0.45) * u_intensity;
+      float w3 = (ridge * 0.5 + ridge2 * 0.5) * u_intensity * 0.8;
+      col = softBlend(w1, w2, w3);
+
+    } else if (u_effect == 22) {
+      vec2 w  = warp(p * 0.7, t * 0.5);
+      vec2 w2 = warp(p * 0.4 + w * 0.3, t * 0.3);
+      vec2 wp = p + w * (0.4 + dist * 0.6);
+      float n1 = snoise(wp * (1.4 + cpx * 1.6) + t * 0.14);
+      float n2 = snoise((wp + w2 * dist * 0.4) * (2.0 + cpx * 2.0) + vec2(3.0, 7.0) - t * 0.1);
+      float ridge1 = 1.0 - abs(n1);
+      ridge1 = pow(ridge1, 5.0 + shp * 12.0);
+      float ridge2 = 1.0 - abs(n2);
+      ridge2 = pow(ridge2, 4.0 + shp * 10.0);
+      float base = (n1 + n2) * 0.25 + 0.5;
+      float w1 = (base * 0.6 + ridge1 * 1.2) * u_intensity;
+      float w2c = ((1.0 - base) * 0.6 + ridge2 * 1.0) * u_intensity;
+      float w3 = (ridge1 * 0.8 + ridge2 * 0.6) * u_intensity;
+      col = softBlend(w1, w2c, w3);
+
+    } else if (u_effect == 23) {
+      float angle = 0.1 + shp * 1.4;
+      float ca = cos(angle), sa = sin(angle);
+      vec2 rp = vec2(p.x * ca - p.y * sa, p.x * sa + p.y * ca);
+      vec2 stretch = vec2(rp.x * (5.0 + cpx * 4.0), rp.y * (0.35 + cpx * 0.3));
+      vec2 sw = warp(stretch * 0.3, t * 0.3) * dist;
+      float n1 = snoise(stretch + sw + t * 0.08);
+      float n2 = snoise(stretch * 1.4 + vec2(2.0, 5.0) + sw - t * 0.06);
+      float streak = 1.0 - abs(n1);
+      streak = pow(streak, 6.0 + shp * 12.0);
+      float streak2 = 1.0 - abs(n2);
+      streak2 = pow(streak2, 4.0 + shp * 8.0);
+      float bg = nfbm(p * 0.4 + t * 0.04) * 0.4 + 0.4;
+      float w1 = (streak * 1.4 + bg * 0.3) * u_intensity;
+      float w2 = (streak2 * 0.9 + bg * 0.5) * u_intensity;
+      float w3 = (streak * 0.7 + streak2 * 0.4) * u_intensity * 0.8;
+      col = softBlend(w1, w2, w3);
+
+    } else if (u_effect == 24) {
+      vec2 w1 = warp(p * 0.55, t * 0.4);
+      vec2 w2 = warp(p * 0.7 + w1 * 0.4, t * 0.3);
+      vec2 wp = p + (w1 + w2) * (0.4 + dist * 0.7);
+
+      float scale = 0.65 + cpx * 0.7;
+      float n1 = nfbm(wp * scale + vec2(0.0, 0.0) + t * 0.10);
+      float n2 = nfbm(wp * scale + vec2(3.7, 5.2) - t * 0.07);
+      float n3 = nfbm(wp * scale + vec2(7.1, 2.3) + t * 0.06);
+      float n4 = nfbm(wp * scale + vec2(1.8, 8.4) - t * 0.08);
+      float n5 = nfbm(wp * scale + vec2(4.9, 1.1) + t * 0.05);
+      float n6 = nfbm(wp * scale + vec2(6.3, 7.8) - t * 0.09);
+      float n7 = nfbm(wp * scale + vec2(2.4, 4.6) + t * 0.04);
+
+      float pw = 2.5 + shp * 5.0;
+      n1 = pow(clamp(n1, 0.0, 1.0), pw);
+      n2 = pow(clamp(n2, 0.0, 1.0), pw);
+      n3 = pow(clamp(n3, 0.0, 1.0), pw);
+      n4 = pow(clamp(n4, 0.0, 1.0), pw);
+      n5 = pow(clamp(n5, 0.0, 1.0), pw);
+      n6 = pow(clamp(n6, 0.0, 1.0), pw);
+      n7 = pow(clamp(n7, 0.0, 1.0), pw);
+
+      float intens = 0.5 + u_intensity * 0.9;
+      float a1 = n1 * u_alpha1 * intens;
+      float a2 = n2 * u_alpha2 * intens;
+      float a3 = n3 * u_alpha3 * intens;
+      float a4 = n4 * u_alpha4 * intens;
+      float a5 = n5 * u_alpha5 * intens;
+      float a6 = n6 * u_alpha6 * intens;
+      float a7 = n7 * u_alpha7 * intens;
+      float total = a1 + a2 + a3 + a4 + a5 + a6 + a7 + 0.001;
+      col = (u_color1 * a1 + u_color2 * a2 + u_color3 * a3 + u_color4 * a4
+           + u_color5 * a5 + u_color6 * a6 + u_color7 * a7) / total;
+
+    } else if (u_effect == 25) {
+      float d = (uv.x + (1.0 - uv.y)) * 0.5;
+      float w = 0.9 / max(u_scale, 0.25);
+      float cyc = t * 0.08;
+      float pA = mix(-w, 1.0 + w, sweepEase(fract(cyc)));
+      float pB = mix(-w, 1.0 + w, sweepEase(fract(cyc + 0.5)));
+      float band = max(
+        clamp(1.0 - abs(d - pA) / w, 0.0, 1.0),
+        clamp(1.0 - abs(d - pB) / w, 0.0, 1.0)
+      );
+      float v = band * u_intensity;
+
+      vec2 ggs = gridCounts(6.0 + u_cellSize * 74.0);
+      if (u_dotMode > 1.5) {
+        ggs = max(vec2(2.0), floor(ggs * (1.0 - u_gap * 0.8)));
+      }
+      vec2 cell = floor(uv * ggs);
+      float clk = t * 1.6;
+      // Wrap the stepped clock to keep sin() arguments small. u_time grows
+      // unbounded over a session; on mediump-float GPUs (older Android, some
+      // iOS) large hash inputs lose precision and the flicker bands/freezes.
+      // mod(x, 1024) keeps the crossfade continuous across the wrap
+      // (step 1023 fades into step 0, whose hash is the next s0).
+      float step0 = mod(floor(clk), 1024.0);
+      float step1 = mod(step0 + 1.0, 1024.0);
+      float fz = smoothstep(0.0, 1.0, fract(clk));
+      float cellSeed = dot(cell, vec2(127.1, 311.7));
+      float r1 = fract(sin(cellSeed + step0 * 17.23) * 43758.5453);
+      float r2 = fract(sin(cellSeed + step1 * 17.23) * 43758.5453);
+      float rnd = mix(r1, r2, fz);
+      v += (rnd - 0.5) * u_flicker * 0.9 * (0.15 + band * 0.85);
+
+      col = palette(clamp(v, 0.0, 1.0));
+    }
+
+    return col;
+  }
+
+  void main() {
+    vec2 uv = gl_FragCoord.xy / u_resolution;
+    float aspect = u_resolution.x / u_resolution.y;
+    float t = u_time * u_speed;
+    float dist = u_distortion;
+    float soft = u_softness;
+    float cpx = u_complexity;
+    float shp = u_shape;
+
+    vec2 sampleUV = uv;
+    if (u_dotMode > 0.5) {
+      vec2 gs = gridCounts(6.0 + u_cellSize * 74.0);
+      if (u_dotMode > 1.5) {
+        gs = max(vec2(2.0), floor(gs * (1.0 - u_gap * 0.8)));
+      }
+      sampleUV = (floor(uv * gs) + vec2(0.5)) / gs;
+    }
+
+    vec3 col;
+    if (u_blur < 0.01) {
+      col = computeEffect(sampleUV, aspect, t, dist, soft, cpx, shp);
+    } else {
+      float r = u_blur * 0.02;
+      col  = computeEffect(sampleUV, aspect, t, dist, soft, cpx, shp) * 0.4;
+      col += computeEffect(sampleUV + vec2( r,  0.0), aspect, t, dist, soft, cpx, shp) * 0.15;
+      col += computeEffect(sampleUV + vec2(-r,  0.0), aspect, t, dist, soft, cpx, shp) * 0.15;
+      col += computeEffect(sampleUV + vec2( 0.0,  r), aspect, t, dist, soft, cpx, shp) * 0.15;
+      col += computeEffect(sampleUV + vec2( 0.0, -r), aspect, t, dist, soft, cpx, shp) * 0.15;
+    }
+
+    vec3 baseCol = col;
+    if (u_dotMode < 0.5) {
+      col = pow(col, vec3(1.3));
+    }
+
+    // CSS-pixel distance to the nearest edge — keeps the vignette / edge-fade
+    // bands a consistent physical width on every side of any aspect ratio.
+    vec2 cssRes = u_resolution / max(u_dpr, 0.0001);
+    vec2 cssCoord = uv * cssRes;
+    float edgeDistPx = min(
+      min(cssCoord.x, cssRes.x - cssCoord.x),
+      min(cssCoord.y, cssRes.y - cssCoord.y)
+    );
+    float vigRangePx = 40.0 * (1.0 + u_vignette * 3.0);
+    float vig = (edgeDistPx * edgeDistPx) / (vigRangePx * vigRangePx);
+    vig = smoothstep(0.0, 1.0, vig);
+    col *= mix(1.0, vig, u_vignette * u_vigOpacity);
+
+    float colorAlpha = (u_alpha1 + u_alpha2 + u_alpha3 + u_alpha4 + u_alpha5) / 5.0;
+    if (colorAlpha < 0.999) {
+      vec3 c1d = col - u_color1, c2d = col - u_color2, c3d = col - u_color3, c4d = col - u_color4, c5d = col - u_color5;
+      float prox1 = exp(-8.0 * dot(c1d, c1d));
+      float prox2 = exp(-8.0 * dot(c2d, c2d));
+      float prox3 = exp(-8.0 * dot(c3d, c3d));
+      float prox4 = exp(-8.0 * dot(c4d, c4d));
+      float prox5 = exp(-8.0 * dot(c5d, c5d));
+      float pTotal = prox1 + prox2 + prox3 + prox4 + prox5 + 0.0001;
+      colorAlpha = (prox1*u_alpha1 + prox2*u_alpha2 + prox3*u_alpha3 + prox4*u_alpha4 + prox5*u_alpha5) / pTotal;
+    }
+    float alpha = colorAlpha;
+
+    if (u_dotMode > 0.5) {
+      vec2 gridSize = gridCounts(6.0 + u_cellSize * 74.0);
+      if (u_dotMode > 1.5) {
+        gridSize = max(vec2(2.0), floor(gridSize * (1.0 - u_gap * 0.8)));
+      }
+      // cellLocal is in [0,1] within each cell. Because gridSize was chosen so
+      // that cell PIXEL size is square, distance / mask math here works in
+      // screen-square units even though we're operating in normalised cell uv.
+      vec2 cellLocal = fract(uv * gridSize);
+
+      float hlFactor = 0.0;
+      if (u_highlight > 0.01 || u_hlScale > 0.01) {
+        vec2 cellCenter = (floor(uv * gridSize) + vec2(0.5)) / gridSize;
+        vec2 cp2 = (cellCenter - 0.5) * u_scale;
+        cp2.x *= aspect;
+        float lw = sin(cp2.x * 3.0 + t * 1.5) * 0.5 + 0.5;
+        lw *= sin(cp2.y * 2.5 - t * 1.1) * 0.5 + 0.5;
+        lw += (snoise(cp2 * 2.0 + t * 0.6) * 0.5 + 0.5) * 0.3;
+        hlFactor = clamp(lw, 0.0, 1.0);
+        hlFactor *= hlFactor;
+      }
+
+      float scaleBoost = 1.0 + smoothstep(0.2, 0.8, hlFactor) * u_hlScale * 1.2;
+
+      float mask = 1.0;
+      if (u_dotMode < 1.5) {
+        float gapW = u_gap * 0.35 / scaleBoost;
+        if (gapW > 0.003) {
+          mask = step(gapW, cellLocal.x) * step(gapW, 1.0 - cellLocal.x)
+               * step(gapW, cellLocal.y) * step(gapW, 1.0 - cellLocal.y);
+        }
+      } else {
+        // Render the circular dot mask in screen-pixel space rather than
+        // cell-local UV. We map the cell-local offset to actual pixels
+        // (cellPx = u_resolution / gridSize), then apply a 1-pixel AA
+        // floor to the smoothstep edge so the dot rim is crisp and
+        // properly anti-aliased even at u_dotSoftness near 0. The user
+        // softness slider still scales linearly on top of the floor.
+        // No fwidth() / GL_OES_standard_derivatives needed - dPx is
+        // already in pixel units, so a fixed 1-px edge IS pixel-perfect.
+        // gridCounts() already keeps cells square in screen space, so
+        // pxOffset traces true circles (not ellipses) on any aspect.
+        vec2 cellPx = u_resolution / gridSize;
+        vec2 pxOffset = (cellLocal - 0.5) * cellPx;
+        float dPx = length(pxOffset);
+        float minCellPx = min(cellPx.x, cellPx.y);
+        float radiusPx = u_dotSize * 0.5 * minCellPx * scaleBoost;
+        // 0.5-px AA floor (1-px total smoothstep ramp) keeps the rim
+        // pixel-perfect at u_dotSoftness=0 while letting the user softness
+        // value dominate at the bundled preset defaults (e.g. softness=0.1
+        // on a ~28-px cell yields softPx=0.56 -> ~1.1-px ramp, matching
+        // the original cell-local behaviour). A larger floor (e.g. 1.0)
+        // would widen low-softness dots and visually lighten dot presets.
+        float aaPx = 0.5;
+        float softPx = u_dotSoftness * 0.2 * minCellPx;
+        float edgePx = max(aaPx, softPx);
+        mask = 1.0 - smoothstep(radiusPx - edgePx, radiusPx + edgePx, dPx);
+      }
+
+      if (u_highlight > 0.01) {
+        float hl = hlFactor * u_highlight;
+        col = col * (1.0 + hl * 2.5) + vec3(hl * hl * 0.3);
+      }
+
+      if (u_edgeFade > 0.5 && u_fadeStr > 0.005) {
+        float ef = smoothstep(0.0, u_edgeFade, edgeDistPx);
+        mask *= mix(1.0, ef, u_fadeStr);
+      }
+
+      float baseOpacity = (u_dotMode < 1.5) ? u_fillOpacity : 0.0;
+      alpha = colorAlpha * mix(baseOpacity, u_dotOpacity, mask);
+
+      float bgLum  = dot(u_cardBg, vec3(0.299, 0.587, 0.114));
+      float colLum = dot(baseCol, vec3(0.299, 0.587, 0.114));
+      alpha *= smoothstep(0.0, 0.33, abs(colLum - bgLum));
+    }
+
+    gl_FragColor = vec4(col, alpha * u_shaderOpacity);
+  }
+`;
+
+  // the package's engine constants (dist: He, Me, Ct, Nt, qt, De, Vt) and its cycle's revealFadeOutMs
+  const ZIA_IMG_FRAME_MS = 1e3 / 10;
+  const ZIA_IMG_MAX_DPR = 1.25;
+  const ZIA_IMG_MAX_CANVAS_DPR = 2;
+  const ZIA_IMG_SAMPLE = 64;
+  const ZIA_IMG_SAMPLE_DOTS = 96;
+  const ZIA_IMG_REF_DIM = 320;
+  const ZIA_IMG_COVER_INSET = 6e-3;
+  const ZIA_IMG_HIDE_MS = 300;
+  // this port's own: the reduced-motion / no-WebGL crossfade, and how long the
+  // shared context outlives its last loader (so each hover doesn't recompile)
+  const ZIA_IMG_FADE_MS = 200;
+  const ZIA_IMG_KEEP_GL_MS = 30e3;
+  // hosts that can't hold rendered children: the loader goes over them, as a sibling
+  const ZIA_IMG_REPLACED = /^(canvas|img|video|iframe|embed|object|picture|svg|input|textarea|select)$/i;
+  const ZIA_IMG_MASK_SLOT = { shaderColor1: 0, shaderColor2: 1, shaderColor3: 2, shaderColor4: 3, shaderColor5: 4 };
+
+  // the package's easings (dist: Ke / Pe)
+  const ZIA_IMG_EASE = {
+    linear: (e) => e,
+    smoothstep: (e) => e * e * (3 - 2 * e),
+    easeOutCubic: (e) => 1 - Math.pow(1 - e, 3),
+    easeOutQuint: (e) => 1 - Math.pow(1 - e, 5),
+    easeInOutCubic: (e) => (e < 0.5 ? 4 * e * e * e : 1 - Math.pow(-2 * e + 2, 3) / 2),
+    easeOutExpo: (e) => (e === 1 ? 1 : 1 - Math.pow(2, -10 * e)),
+    easeOutBack: (e) => 1 + (1.70158 + 1) * Math.pow(e - 1, 3) + 1.70158 * Math.pow(e - 1, 2),
+  };
+
+  function ziaImgEase(key, t) {
+    return (ZIA_IMG_EASE[key] ?? ZIA_IMG_EASE.smoothstep)(Math.max(0, Math.min(1, t)));
+  }
+
+  function ziaImgEl(tag) {
+    return document.createElementNS(ZIA_IMG_NS, tag);
+  }
+
+  function ziaImgOpacity(el, v) {
+    const s = String(v);
+    if (el.style.opacity !== s) {
+      el.style.opacity = s;
+    }
+  }
+
+  // ---- colours (dist: be / ze)
+
+  let ziaImgColorCtx;
+
+  function ziaImgParseColor(e) {
+    if (typeof e !== "string" || e.length === 0) {
+      return [0, 0, 0];
+    }
+    if (e[0] === "#") {
+      let l = e.slice(1);
+      if (l.length === 3) {
+        l = l[0] + l[0] + l[1] + l[1] + l[2] + l[2];
+      }
+      if ((l.length === 6 || l.length === 8) && /^[0-9a-fA-F]+$/.test(l)) {
+        return [parseInt(l.slice(0, 2), 16) / 255, parseInt(l.slice(2, 4), 16) / 255, parseInt(l.slice(4, 6), 16) / 255];
+      }
+    }
+    if (ziaImgColorCtx === undefined) {
+      const c = ziaImgEl("canvas");
+      c.width = 1;
+      c.height = 1;
+      ziaImgColorCtx = c.getContext("2d");
+    }
+    const t = ziaImgColorCtx;
+    if (!t) {
+      return [0, 0, 0];
+    }
+    t.fillStyle = "#000000";
+    t.fillStyle = e;
+    const a = t.fillStyle;
+    t.fillStyle = "#ffffff";
+    t.fillStyle = e;
+    if (a !== t.fillStyle) {
+      return [0, 0, 0];
+    }
+    if (a[0] === "#") {
+      return [parseInt(a.slice(1, 3), 16) / 255, parseInt(a.slice(3, 5), 16) / 255, parseInt(a.slice(5, 7), 16) / 255];
+    }
+    const i = a.match(/^rgba?\(\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)\s*,\s*(-?[\d.]+)/);
+    if (i) {
+      const l = (c) => Math.max(0, Math.min(255, c)) / 255;
+      return [l(parseFloat(i[1])), l(parseFloat(i[2])), l(parseFloat(i[3]))];
+    }
+    return [0, 0, 0];
+  }
+
+  // a palette slot, swapped for the card colour where it was the preset's card colour
+  function ziaImgPresetColor(inst, slot) {
+    const a = inst.preset;
+    const [n, o, i] = ziaImgParseColor(a.colors[slot]);
+    if (inst.cardBgOverride == null) {
+      return [n, o, i];
+    }
+    const [l, c, f] = ziaImgParseColor(a.cardBg);
+    const s = (h) => Math.round(h * 255);
+    return s(n) === s(l) && s(o) === s(c) && s(i) === s(f) ? ziaImgParseColor(inst.cardBgOverride) : [n, o, i];
+  }
+
+  // a slot's colour as the shader gets it: the per-slot override where there
+  // is one (the package's colors prop / Instance.colorsOverride, dist: It), else
+  // the preset's (dist: ze)
+  function ziaImgSlotColor(inst, slot) {
+    const o = inst.colorsOverride && inst.colorsOverride[slot];
+    return o || ziaImgPresetColor(inst, slot);
+  }
+
+  // Zia's palette option: a few CSS colours spread over the preset's 7 shader
+  // slots the way the package re-tints its colour field from an image
+  // (triggerRegenerate's tint, dist: la): the colours and the preset's slots
+  // are each ranked by luminance (0.299 / 0.587 / 0.114), and the slot of rank
+  // u takes the colour at quantile 0.05 + 0.9 * u / 6. The result is fed as
+  // the colors override (dist: Ht), so the animation, the cell grid and the
+  // card colour the shader reasons against stay the preset's.
+  function ziaImgRetint(preset, palette) {
+    const lum = (c) => 0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2];
+    const px = [];
+    for (const v of palette) {
+      if (typeof v === "string" && v) {
+        px.push(ziaImgParseColor(v));
+      }
+    }
+    if (px.length === 0) {
+      return null;
+    }
+    px.sort((a, b) => lum(a) - lum(b));
+    const slots = preset.colors
+      .map((c, slot) => ({ slot, lum: lum(ziaImgParseColor(c)) }))
+      .sort((a, b) => a.lum - b.lum);
+    const out = new Array(slots.length);
+    for (let u = 0; u < slots.length; u++) {
+      const g = 0.05 + (0.9 * u) / Math.max(1, slots.length - 1);
+      out[slots[u].slot] = px[Math.min(px.length - 1, Math.round(g * (px.length - 1)))];
+    }
+    return out;
+  }
+
+  // ---- the shared engine: one WebGL context, one program, one rAF loop (dist: Mt / lt / it / st / Ee)
+
+  let ziaImgShared = null;
+
+  function ziaImgGLOk(eng) {
+    return !!(eng.gl && eng.prog && !eng.contextLost);
+  }
+
+  function ziaImgCompile(gl, type, src) {
+    const sh = gl.createShader(type);
+    gl.shaderSource(sh, src);
+    gl.compileShader(sh);
+    if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+      if (!gl.isContextLost()) {
+        console.warn("ziaImgFx: shader failed to compile", gl.getShaderInfoLog(sh));
+      }
+      gl.deleteShader(sh);
+      return null;
+    }
+    return sh;
+  }
+
+  // (re)builds the program and state; what three's WebGLRenderer + ShaderMaterial set up
+  function ziaImgInitGL(eng) {
+    eng.prog = null;
+    const gl = eng.gl;
+    if (!gl || gl.isContextLost()) {
+      return false;
+    }
+    // three's ShaderMaterial wrapping: GLSL ES 3.00 with gl_FragColor mapped to
+    // an output, and highp (its default precision) for floats and ints
+    const hi = eng.gl2 || gl.getShaderPrecisionFormat(gl.FRAGMENT_SHADER, gl.HIGH_FLOAT).precision > 0;
+    const precision = `precision ${hi ? "highp" : "mediump"} float;\nprecision ${hi ? "highp" : "mediump"} int;\n`;
+    const vs = eng.gl2
+      ? `#version 300 es\n#define attribute in\n#define varying out\n${precision}attribute vec3 position;\n${ZIA_IMG_VERT}`
+      : `${precision}attribute vec3 position;\n${ZIA_IMG_VERT}`;
+    const fs = eng.gl2
+      ? `#version 300 es\n#define varying in\nlayout(location = 0) out highp vec4 pc_fragColor;\n#define gl_FragColor pc_fragColor\n${precision}${ZIA_IMG_FRAG}`
+      : `${precision}${ZIA_IMG_FRAG}`;
+    const v = ziaImgCompile(gl, gl.VERTEX_SHADER, vs);
+    const f = v && ziaImgCompile(gl, gl.FRAGMENT_SHADER, fs);
+    if (!v || !f) {
+      return false;
+    }
+    const prog = gl.createProgram();
+    gl.attachShader(prog, v);
+    gl.attachShader(prog, f);
+    gl.bindAttribLocation(prog, 0, "position");
+    gl.linkProgram(prog);
+    gl.deleteShader(v);
+    gl.deleteShader(f);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+      if (!gl.isContextLost()) {
+        console.warn("ziaImgFx: program failed to link", gl.getProgramInfoLog(prog));
+      }
+      gl.deleteProgram(prog);
+      return false;
+    }
+    // three's PlaneGeometry(2, 2) under the pass-through vertex shader: the whole viewport
+    const buf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+    gl.useProgram(prog);
+    // transparent, depthTest/depthWrite off, NormalBlending with a straight-alpha
+    // material (three: SRC_ALPHA, ONE_MINUS_SRC_ALPHA, ONE, ONE_MINUS_SRC_ALPHA),
+    // over a clear to (0, 0, 0, 0) inside the scissored viewport
+    gl.disable(gl.DEPTH_TEST);
+    gl.disable(gl.CULL_FACE);
+    gl.enable(gl.BLEND);
+    gl.blendEquation(gl.FUNC_ADD);
+    gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    gl.enable(gl.SCISSOR_TEST);
+    gl.clearColor(0, 0, 0, 0);
+    eng.prog = prog;
+    eng.buf = buf;
+    eng.loc = Object.create(null);
+    eng.uv = Object.create(null);
+    eng.lastInstance = null;
+    return true;
+  }
+
+  function ziaImgLoc(eng, name) {
+    if (!(name in eng.loc)) {
+      eng.loc[name] = eng.gl.getUniformLocation(eng.prog, name);
+    }
+    return eng.loc[name];
+  }
+
+  // uniform setters that skip unchanged values (three's uniform cache does the same)
+  function ziaImgU1(eng, name, v, int) {
+    if (eng.uv[name] === v) {
+      return;
+    }
+    eng.uv[name] = v;
+    const loc = ziaImgLoc(eng, name);
+    if (loc) {
+      if (int) {
+        eng.gl.uniform1i(loc, v);
+      } else {
+        eng.gl.uniform1f(loc, v);
+      }
+    }
+  }
+
+  function ziaImgUN(eng, name, v) {
+    const c = eng.uv[name];
+    if (c && c.length === v.length && c.every((x, i) => x === v[i])) {
+      return;
+    }
+    eng.uv[name] = v.slice();
+    const loc = ziaImgLoc(eng, name);
+    if (loc) {
+      if (v.length === 2) {
+        eng.gl.uniform2f(loc, v[0], v[1]);
+      } else {
+        eng.gl.uniform3f(loc, v[0], v[1], v[2]);
+      }
+    }
+  }
+
+  function ziaImgEngine() {
+    let eng = ziaImgShared;
+    if (eng) {
+      if (eng.keepTimer) {
+        clearTimeout(eng.keepTimer);
+        eng.keepTimer = 0;
+      }
+      return eng;
+    }
+    const glCanvas = ziaImgEl("canvas");
+    glCanvas.width = 8;
+    glCanvas.height = 8;
+    eng = ziaImgShared = {
+      glCanvas,
+      gl: null,
+      gl2: false,
+      prog: null,
+      buf: null,
+      loc: null,
+      uv: null,
+      pixelRatio: Math.min(window.devicePixelRatio || 1, ZIA_IMG_MAX_DPR),
+      instances: new Set(),
+      rafId: 0,
+      lastFrameMs: 0,
+      lastTickMs: performance.now(),
+      churning: false,
+      lastInstance: null,
+      contextLost: false,
+      keepTimer: 0,
+      reduceQuery: null,
+      listeners: [],
+    };
+    // three's context attributes, but not "high-performance" (that wakes a
+    // laptop's discrete GPU for a hover card), and no depth buffer (unused)
+    const attrs = {
+      alpha: true,
+      premultipliedAlpha: false,
+      preserveDrawingBuffer: false,
+      antialias: false,
+      depth: false,
+      stencil: false,
+      powerPreference: "low-power",
+    };
+    try {
+      eng.gl = glCanvas.getContext("webgl2", attrs);
+      eng.gl2 = !!eng.gl;
+      if (!eng.gl) {
+        eng.gl = glCanvas.getContext("webgl", attrs);
+      }
+      ziaImgInitGL(eng);
+    } catch (err) {
+      eng.prog = null;
+    }
+    const listen = (target, type, fn) => {
+      target.addEventListener(type, fn, false);
+      eng.listeners.push([target, type, fn]);
+    };
+    listen(glCanvas, "webglcontextlost", (event) => {
+      event.preventDefault();
+      eng.contextLost = true;
+      // a dissolve can't go on without the shader: show its image
+      for (const inst of eng.instances) {
+        inst.reveal.finishNow();
+      }
+    });
+    listen(glCanvas, "webglcontextrestored", () => {
+      eng.contextLost = false;
+      ziaImgInitGL(eng);
+      for (const inst of eng.instances) {
+        inst.uniformsDirty = true;
+        ziaImgRenderNow(eng, inst);
+      }
+      ziaImgKick(eng);
+    });
+    listen(document, "visibilitychange", () => {
+      for (const inst of eng.instances) {
+        ziaImgUpdateVisible(eng, inst);
+      }
+    });
+    eng.reduceQuery = window.matchMedia ? window.matchMedia("(prefers-reduced-motion: reduce)") : null;
+    if (eng.reduceQuery) {
+      listen(eng.reduceQuery, "change", () => {
+        for (const inst of eng.instances) {
+          inst.reduced = eng.reduceQuery.matches;
+          if (inst.reduced) {
+            inst.reveal.finishNow();
+          }
+          ziaImgRenderNow(eng, inst);
+        }
+        ziaImgKick(eng);
+      });
+    }
+    return eng;
+  }
+
+  function ziaImgRelease(eng) {
+    if (eng.instances.size || eng.keepTimer || eng !== ziaImgShared) {
+      return;
+    }
+    eng.keepTimer = setTimeout(() => {
+      eng.keepTimer = 0;
+      if (eng.instances.size || eng !== ziaImgShared) {
+        return;
+      }
+      ziaImgShared = null;
+      if (eng.rafId) {
+        cancelAnimationFrame(eng.rafId);
+        eng.rafId = 0;
+      }
+      for (const [target, type, fn] of eng.listeners) {
+        target.removeEventListener(type, fn, false);
+      }
+      eng.listeners = [];
+      const gl = eng.gl;
+      if (gl && !gl.isContextLost()) {
+        if (eng.prog) {
+          gl.deleteProgram(eng.prog);
+        }
+        if (eng.buf) {
+          gl.deleteBuffer(eng.buf);
+        }
+        gl.getExtension("WEBGL_lose_context")?.loseContext();
+      }
+      eng.gl = null;
+      eng.prog = null;
+      eng.glCanvas.width = 1;
+      eng.glCanvas.height = 1;
+    }, ZIA_IMG_KEEP_GL_MS);
+  }
+
+  // the package's uniforms from a preset block (dist: It)
+  function ziaImgApplyPreset(eng, inst) {
+    const a = inst.preset;
+    ziaImgU1(eng, "u_effect", a.effectIndex, true);
+    ziaImgU1(eng, "u_speed", a.speed);
+    ziaImgU1(eng, "u_intensity", a.intensity);
+    ziaImgU1(eng, "u_scale", a.scale);
+    ziaImgU1(eng, "u_direction", (a.direction * Math.PI) / 180);
+    ziaImgU1(eng, "u_softness", a.softness);
+    ziaImgU1(eng, "u_distortion", a.distortion);
+    ziaImgU1(eng, "u_complexity", a.complexity);
+    ziaImgU1(eng, "u_shape", a.shape);
+    ziaImgU1(eng, "u_flicker", a.flicker ?? 0);
+    ziaImgU1(eng, "u_vignette", a.vignette);
+    ziaImgU1(eng, "u_vigOpacity", a.vigOpacity);
+    ziaImgU1(eng, "u_blur", a.blur);
+    ziaImgU1(eng, "u_highlight", a.highlight);
+    ziaImgU1(eng, "u_shaderOpacity", a.shaderOpacity);
+    ziaImgU1(eng, "u_dotMode", a.dotMode);
+    ziaImgU1(eng, "u_sweepEase", a.sweepEase != null ? Math.floor(a.sweepEase) : 0, true);
+    const o = a.dotMode === 1 ? a.pixelConfig : a.dotConfig;
+    ziaImgU1(eng, "u_cellSize", o.cellSize);
+    ziaImgU1(eng, "u_gap", o.gap);
+    ziaImgU1(eng, "u_dotSize", o.dotSize);
+    ziaImgU1(eng, "u_dotSoftness", o.dotSoftness);
+    ziaImgU1(eng, "u_dotOpacity", o.dotOpacity);
+    ziaImgU1(eng, "u_hlScale", o.hlScale);
+    ziaImgU1(eng, "u_fillOpacity", o.fillOpacity);
+    ziaImgU1(eng, "u_edgeFade", o.edgeFade);
+    ziaImgU1(eng, "u_fadeStr", o.fadeStr);
+    if (!inst.colors) {
+      inst.colors = [];
+      for (let s = 0; s < 7; s++) {
+        inst.colors.push(ziaImgSlotColor(inst, s));
+      }
+      inst.colors.push(ziaImgParseColor(inst.cardBgOverride ?? a.cardBg));
+    }
+    for (let s = 0; s < 7; s++) {
+      ziaImgUN(eng, `u_color${s + 1}`, inst.colors[s]);
+      ziaImgU1(eng, `u_alpha${s + 1}`, a.alphas[s]);
+    }
+    ziaImgUN(eng, "u_cardBg", inst.colors[7]);
+    inst.uniformsDirty = false;
+  }
+
+  // grows the GL canvas to the biggest loader showing (dist: lt)
+  function ziaImgGrow(eng, also) {
+    const pr = Math.min(window.devicePixelRatio || 1, ZIA_IMG_MAX_DPR);
+    if (pr !== eng.pixelRatio) {
+      eng.pixelRatio = pr;
+      eng.lastInstance = null;
+    }
+    let t = 0;
+    let a = 0;
+    for (const h of eng.instances) {
+      if (h !== also && (!h.visible || h.paused)) {
+        continue;
+      }
+      if (h.cssWidth > t) {
+        t = h.cssWidth;
+      }
+      if (h.cssHeight > a) {
+        a = h.cssHeight;
+      }
+    }
+    if (t <= 0 || a <= 0) {
+      return;
+    }
+    const n = eng.pixelRatio;
+    const o = Math.max(1, Math.floor(t * n));
+    const i = Math.max(1, Math.floor(a * n));
+    const l = eng.glCanvas.width;
+    const c = eng.glCanvas.height;
+    if (o <= l && i <= c) {
+      return;
+    }
+    const f = Math.max(t, l / Math.max(n, 1e-4));
+    const s = Math.max(a, c / Math.max(n, 1e-4));
+    eng.glCanvas.width = Math.floor(f * n);
+    eng.glCanvas.height = Math.floor(s * n);
+  }
+
+  function ziaImgDraw(eng) {
+    const gl = eng.gl;
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  }
+
+  // one loader's frame: the shader into the shared canvas's bottom-left corner,
+  // copied (nearest-neighbour) into the loader's own 2D canvas (dist: it)
+  function ziaImgRender(eng, t, a) {
+    if (!ziaImgGLOk(eng)) {
+      return;
+    }
+    const gl = eng.gl;
+    const n = Math.max(1, Math.floor(t.cssWidth * t.dpr));
+    const o = Math.max(1, Math.floor(t.cssHeight * t.dpr));
+    const vw = Math.round(Math.max(1, t.cssWidth) * eng.pixelRatio);
+    const vh = Math.round(Math.max(1, t.cssHeight) * eng.pixelRatio);
+    gl.viewport(0, 0, vw, vh);
+    gl.scissor(0, 0, vw, vh);
+    ziaImgUN(eng, "u_resolution", [n, o]);
+    ziaImgU1(eng, "u_dpr", t.dpr || 1);
+    if (eng.lastInstance !== t || t.uniformsDirty) {
+      ziaImgApplyPreset(eng, t);
+      eng.lastInstance = t;
+    }
+    ziaImgU1(eng, "u_time", t.accumulatedTime);
+    ziaImgDraw(eng);
+    const f = Math.max(1, Math.floor(t.cssWidth * t.canvasDpr));
+    const s = Math.max(1, Math.floor(t.cssHeight * t.canvasDpr));
+    if (t.canvas.width !== f || t.canvas.height !== s) {
+      t.canvas.width = f;
+      t.canvas.height = s;
+    }
+    t.ctx.clearRect(0, 0, f, s);
+    const h = eng.glCanvas.height - o;
+    t.ctx.imageSmoothingEnabled = false;
+    t.ctx.drawImage(eng.glCanvas, 0, h, n, o, 0, 0, f, s);
+    if (t.shownAtMs < 0) {
+      t.shownAtMs = a;
+    }
+    t.reveal.afterShaderFrame(eng, t, a);
+    if (t.reveal.isActive()) {
+      eng.lastInstance = null;
+    }
+  }
+
+  // a frame now, outside the loop (dist: Be)
+  function ziaImgRenderNow(eng, inst) {
+    if (inst.destroyed || !ziaImgGLOk(eng) || !inst.visible || inst.cssWidth < 1 || inst.cssHeight < 1) {
+      return;
+    }
+    ziaImgGrow(eng, inst);
+    ziaImgRender(eng, inst, performance.now());
+  }
+
+  // whether the loop has to draw this loader's shader (not while its image is
+  // held over it, nor for a still or a crossfade)
+  function ziaImgChurns(inst) {
+    return (
+      !inst.destroyed &&
+      inst.visible &&
+      !inst.paused &&
+      !inst.reduced &&
+      inst.cssWidth >= 1 &&
+      inst.cssHeight >= 1 &&
+      inst.reveal.churns()
+    );
+  }
+
+  function ziaImgUpdateVisible(eng, inst) {
+    const v = inst.inView && !document.hidden;
+    if (v === inst.visible) {
+      return;
+    }
+    inst.visible = v;
+    if (v) {
+      ziaImgRenderNow(eng, inst);
+      ziaImgKick(eng);
+    }
+  }
+
+  function ziaImgTryStart(eng, inst, now) {
+    const p = inst.pending;
+    // (a reveal asked for during a hide waits for it to finish)
+    if (!p || inst.destroyed || inst.reveal.isActive()) {
+      return;
+    }
+    if (inst.minChurnMs > 0 && (inst.shownAtMs < 0 || now - inst.shownAtMs < inst.minChurnMs)) {
+      return;
+    }
+    inst.pending = null;
+    inst.reveal.startReveal({
+      image: p.image,
+      simple: inst.reduced || !ziaImgGLOk(eng),
+      onRevealComplete: p.onDone,
+    });
+    ziaImgKick(eng);
+  }
+
+  // the loop: crossfades every frame, shader frames under the fps cap (dist: st)
+  function ziaImgTick(now) {
+    const eng = ziaImgShared;
+    if (!eng) {
+      return;
+    }
+    eng.rafId = 0;
+    let again = false;
+    try {
+      for (const inst of eng.instances) {
+        if (inst.pending) {
+          if (inst.shownAtMs < 0 && inst.visible && inst.cssWidth >= 1 && inst.cssHeight >= 1 && !ziaImgGLOk(eng)) {
+            inst.shownAtMs = now;
+          }
+          ziaImgTryStart(eng, inst, now);
+          if (inst.pending && inst.visible) {
+            again = true;
+          }
+        }
+        if (inst.reveal.stepSimple(now)) {
+          again = true;
+        }
+      }
+      const list = [];
+      if (ziaImgGLOk(eng)) {
+        for (const inst of eng.instances) {
+          if (ziaImgChurns(inst)) {
+            list.push(inst);
+          }
+        }
+      }
+      if (!list.length) {
+        eng.churning = false;
+      } else {
+        again = true;
+        if (!eng.churning) {
+          eng.churning = true;
+          eng.lastTickMs = now;
+          eng.lastFrameMs = now;
+        } else {
+          const t = now - eng.lastFrameMs;
+          if (t >= ZIA_IMG_FRAME_MS) {
+            eng.lastFrameMs = now - (t % ZIA_IMG_FRAME_MS);
+            const a = (now - eng.lastTickMs) / 1e3;
+            eng.lastTickMs = now;
+            for (const inst of list) {
+              inst.accumulatedTime += a;
+            }
+            ziaImgGrow(eng, null);
+            for (const inst of list) {
+              const d = Math.min(window.devicePixelRatio || 1, ZIA_IMG_MAX_DPR);
+              if (inst.dpr !== d) {
+                inst.dpr = d;
+                inst.canvasDpr = Math.min(window.devicePixelRatio || 1, ZIA_IMG_MAX_CANVAS_DPR);
+              }
+              if (!inst.destroyed) {
+                try {
+                  ziaImgRender(eng, inst, now);
+                } catch (err) {
+                  if (!eng.warned) {
+                    eng.warned = true;
+                    console.error("ziaImgFx: frame failed", err);
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    } finally {
+      if (again && eng === ziaImgShared && !eng.rafId) {
+        eng.rafId = requestAnimationFrame(ziaImgTick);
+      }
+    }
+  }
+
+  // starts the loop if it's stopped (dist: Ee)
+  function ziaImgKick(eng) {
+    if (!eng || eng !== ziaImgShared || eng.rafId) {
+      return;
+    }
+    eng.lastTickMs = performance.now();
+    eng.lastFrameMs = eng.lastTickMs;
+    eng.churning = ziaImgGLOk(eng) && [...eng.instances].some(ziaImgChurns);
+    eng.rafId = requestAnimationFrame(ziaImgTick);
+  }
+
+  // ---- the reveal (dist: Qe, he, ct, ut, ft, Xt, jt, aa)
+
+  // object-fit: cover, less a 0.6% inset on each side (dist: Qe)
+  function ziaImgCoverRect(e, t, a) {
+    const n = t / Math.max(1, a);
+    const o = e.width / Math.max(1, e.height);
+    let i = 0;
+    let l = 0;
+    let c = e.width;
+    let f = e.height;
+    if (o > n) {
+      c = e.height * n;
+      i = (e.width - c) / 2;
+    } else {
+      f = e.width / n;
+      l = (e.height - f) / 2;
+    }
+    const s = Math.min(c, f) * ZIA_IMG_COVER_INSET;
+    if (c - 2 * s > 1 && f - 2 * s > 1) {
+      i += s;
+      l += s;
+      c -= 2 * s;
+      f -= 2 * s;
+    }
+    return { sx: i, sy: l, sw: c, sh: f };
+  }
+
+  // the image, cover-fitted at the canvas's size, cached (dist: he)
+  function ziaImgCover(e, a, n, o) {
+    let i = e.coverA;
+    if (!i) {
+      const l = ziaImgEl("canvas");
+      i = e.coverA = { canvas: l, ctx: l.getContext("2d"), img: null, w: 0, h: 0 };
+    }
+    if (i.img !== a || i.w !== n || i.h !== o) {
+      i.canvas.width = n;
+      i.canvas.height = o;
+      i.w = n;
+      i.h = o;
+      i.img = a;
+      const { sx: l, sy: c, sw: f, sh: s } = ziaImgCoverRect(a, n, o);
+      i.ctx.clearRect(0, 0, n, o);
+      i.ctx.imageSmoothingEnabled = true;
+      i.ctx.imageSmoothingQuality = "high";
+      i.ctx.drawImage(a, l, c, f, s, 0, 0, n, o);
+    }
+    return i.canvas;
+  }
+
+  function ziaImgRevealTiming(e) {
+    const t = e.revealConfig;
+    return e.dotMode === 2
+      ? { duration: Math.max(0.05, t.dotDuration), easingKey: t.dotEasing }
+      : { duration: Math.max(0.05, t.duration), easingKey: t.easing };
+  }
+
+  function ziaImgEnsureSample(e, t) {
+    if (!e.sampleCanvas) {
+      e.sampleCanvas = ziaImgEl("canvas");
+      e.sampleCtx = e.sampleCanvas.getContext("2d", { willReadFrequently: true });
+    }
+    if (e.sampleCanvas.width !== t || e.sampleCanvas.height !== t) {
+      e.sampleCanvas.width = t;
+      e.sampleCanvas.height = t;
+      e.sampleImgData = null;
+      e.sampleDataCache = null;
+      e.sampleFrameCounter = 0;
+    }
+    if (!e.maskGrad) {
+      e.maskGrad = ziaImgEl("canvas");
+      e.maskGradCtx = e.maskGrad.getContext("2d");
+    }
+    if (e.maskGrad.width !== t || e.maskGrad.height !== t) {
+      e.maskGrad.width = t;
+      e.maskGrad.height = t;
+      e.maskImgData = null;
+    }
+    if (!e.maskImgData && e.maskGradCtx) {
+      e.maskImgData = e.maskGradCtx.createImageData(t, t);
+    }
+  }
+
+  // the shader re-rendered smooth (no mosaic), shrunk to o x o and read back:
+  // the colour field the dissolve mask is made from (dist: ft)
+  function ziaImgSampleShader(e, eng, a, n, o) {
+    const prevMode = eng.uv.u_dotMode;
+    const prevFill = eng.uv.u_fillOpacity;
+    const c = a.preset.dotMode;
+    const f = c < 1.5 ? 0 : 1;
+    ziaImgU1(eng, "u_dotMode", f);
+    ziaImgU1(eng, "u_fillOpacity", f > 0.5 ? (c === 1 ? a.preset.pixelConfig.fillOpacity : a.preset.dotConfig.fillOpacity) : 0);
+    ziaImgDraw(eng);
+    const s = Math.max(1, Math.floor(a.cssWidth * a.dpr));
+    const h = Math.max(1, Math.floor(a.cssHeight * a.dpr));
+    const u = Math.max(0, eng.glCanvas.height - h);
+    if (!e.sampleGpuCanvas) {
+      e.sampleGpuCanvas = ziaImgEl("canvas");
+      e.sampleGpuCtx = e.sampleGpuCanvas.getContext("2d");
+    }
+    const g = e.sampleGpuCanvas;
+    const m = e.sampleGpuCtx;
+    if (g.width !== o || g.height !== o) {
+      g.width = o;
+      g.height = o;
+    }
+    m.clearRect(0, 0, o, o);
+    m.drawImage(eng.glCanvas, 0, u, s, h, 0, 0, o, o);
+    n.clearRect(0, 0, o, o);
+    n.drawImage(g, 0, 0);
+    ziaImgU1(eng, "u_dotMode", prevMode);
+    ziaImgU1(eng, "u_fillOpacity", prevFill);
+    e.sampleImgData = n.getImageData(0, 0, o, o);
+    e.sampleDataCache = e.sampleImgData.data;
+    return e.sampleDataCache;
+  }
+
+  // the cell hash (dist: inside Xt / ta)
+  function ziaImgHash(U, z) {
+    const q = Math.sin(U * 127.1 + z * 17.23) * 43758.5453;
+    return q - Math.floor(q);
+  }
+
+  // one dissolve frame into the overlay (dist: Xt)
+  function ziaImgRevealFrame(e, eng, a, n) {
+    if (!e.image) {
+      return;
+    }
+    const o = a.preset;
+    const i = a.canvas.width;
+    const l = a.canvas.height;
+    if (n.canvas.width !== i || n.canvas.height !== l) {
+      n.canvas.width = i;
+      n.canvas.height = l;
+    }
+    n.clearRect(0, 0, i, l);
+    const { duration: c, easingKey: f } = ziaImgRevealTiming(o);
+    const s = (performance.now() - e.revealStartMs) / 1e3;
+    const h = Math.min(s / c, 1);
+    const u = ziaImgEase(f, h);
+    const g = e.image;
+    const I = o.revealConfig.blur;
+    const filter = h < 1 && I > 0 && I * (1 - u) > 0.1 ? `blur(${(I * (1 - u)).toFixed(1)}px)` : "none";
+    if (n.canvas.style.filter !== filter) {
+      n.canvas.style.filter = filter;
+    }
+    if (h >= 1) {
+      n.imageSmoothingEnabled = true;
+      n.imageSmoothingQuality = "high";
+      n.drawImage(ziaImgCover(e, g, i, l), 0, 0);
+      return;
+    }
+    const w = o.dotMode === 2 ? ZIA_IMG_SAMPLE_DOTS : ZIA_IMG_SAMPLE;
+    ziaImgEnsureSample(e, w);
+    const M = o.revealConfig.maskShape;
+    const d = o.revealConfig.softness;
+    const x = M.startsWith("shader");
+    let C = null;
+    let y = null;
+    if (x) {
+      const T = e.sampleFrameCounter++;
+      C = e.sampleDataCache == null || (T & 1) === 0 ? ziaImgSampleShader(e, eng, a, e.sampleCtx, w) : e.sampleDataCache;
+      if (ZIA_IMG_MASK_SLOT[M] != null) {
+        // (the package reads the preset colour here even under a colors
+        // override; with Zia's palette the dissolve follows the re-tinted
+        // slot instead, or every cell would reveal in the same last third)
+        y = ziaImgSlotColor(a, ZIA_IMG_MASK_SLOT[M]);
+      }
+    }
+    const _ = 1 - u * (1 + d);
+    const W = M === "gradientSweep";
+    let j = 0;
+    let S = 0;
+    let G = 2;
+    const V = o.flicker ?? 0;
+    let ae = null;
+    let H = null;
+    let R = 0;
+    let X = 0;
+    let A = 0;
+    if (V > 3e-3) {
+      G = Math.max(2, Math.floor(6 + o.pixelConfig.cellSize * 74));
+      const T = a.accumulatedTime * Math.max(o.speed, 2) * 1.6;
+      const Z = Math.floor(T);
+      R = Z % 1024;
+      X = (R + 1) % 1024;
+      A = T - Z;
+      A = A * A * (3 - 2 * A);
+      H = ziaImgHash;
+      const E = G * G;
+      if (!e.gsFlickerTable || e.gsFlickerTable.length !== E) {
+        e.gsFlickerTable = new Float32Array(E);
+      }
+      ae = e.gsFlickerTable;
+      for (let U = 0; U < E; U++) {
+        const z = ziaImgHash(U, R) * (1 - A) + ziaImgHash(U, X) * A;
+        ae[U] = (z - 0.5) * V * 1.6;
+      }
+    }
+    if (W) {
+      j = 0.9 / Math.max(o.scale, 0.25);
+      S = -j + u * (1 + 2 * j);
+    }
+    const ce = e.maskImgData.data;
+    for (let T = 0; T < w; T++) {
+      for (let Z = 0; Z < w; Z++) {
+        let N;
+        if (x && C) {
+          const z = (T * w + Z) * 4;
+          const q = C[z] / 255;
+          const se = C[z + 1] / 255;
+          const r = C[z + 2] / 255;
+          if (y) {
+            const D = q - y[0];
+            const K = se - y[1];
+            const le = r - y[2];
+            N = Math.exp(-8 * (D * D + K * K + le * le));
+          } else {
+            N = (C[z] * 0.299 + C[z + 1] * 0.587 + C[z + 2] * 0.114) / 255;
+          }
+        } else {
+          // (the package's geometric masks, dist: Qt, aren't used by any preset)
+          N = W ? 0 : -1;
+        }
+        let E;
+        if (W) {
+          const z = Z / (w - 1);
+          const q = T / (w - 1);
+          const se = (z + q) * 0.5;
+          E = (S + j - se) / (2 * j);
+        } else {
+          E = (N - _) / d;
+        }
+        if (ae && E > -0.5 && E < 1.5) {
+          const z = E < 0 ? 0 : E > 1 ? 1 : E;
+          const q = z * (1 - z) * 4;
+          if (q > 1e-3) {
+            const se = Z / (w - 1);
+            const r = T / (w - 1);
+            // (on the last row this indexes past the table, as in the package:
+            // NaN, so those mask pixels go clear while the band crosses them)
+            const D = Math.floor(r * G) * G + Math.floor(se * G);
+            E += ae[D] * q;
+          }
+        }
+        if (E < 0) {
+          E = 0;
+        } else if (E > 1) {
+          E = 1;
+        }
+        E = E * E * (3 - 2 * E);
+        const U = (T * w + Z) * 4;
+        ce[U] = 255;
+        ce[U + 1] = 255;
+        ce[U + 2] = 255;
+        ce[U + 3] = (E * 255 + 0.5) | 0;
+      }
+    }
+    e.maskGradCtx.putImageData(e.maskImgData, 0, 0);
+    if (o.dotMode === 1) {
+      // the gradient sweep's mask already flickers along its band, so its dissolve doesn't
+      ziaImgPixelReveal(e, n, g, o, s, i, l, a, W ? 0 : V, H, R, X, A);
+    } else {
+      // (dotMode 2's pixel reveal, dist: $t, isn't used by any preset)
+      n.imageSmoothingEnabled = true;
+      n.imageSmoothingQuality = "high";
+      n.drawImage(ziaImgCover(e, g, i, l), 0, 0);
+      n.globalCompositeOperation = "destination-in";
+      n.drawImage(e.maskGrad, 0, 0, i, l);
+      n.globalCompositeOperation = "source-over";
+    }
+  }
+
+  // the image in cells: each cell pixelated until its random moment, then
+  // sharp, and the whole masked cell by cell (dist: jt)
+  function ziaImgPixelReveal(e, t, a, c, f, s, h, u, g, m, v, b, P) {
+    const w = 6 + c.pixelConfig.cellSize * 74;
+    const oe = Math.max(1, u.cssWidth);
+    const ie = Math.max(1, u.cssHeight);
+    const F = Math.max(2, Math.floor((w * oe) / ZIA_IMG_REF_DIM));
+    const M = Math.max(2, Math.floor((w * ie) / ZIA_IMG_REF_DIM));
+    const d = F * M;
+    const x = Math.max(0.05, c.revealConfig.pixDuration);
+    const C = Math.max(0, Math.min(1, f / x));
+    const y = ziaImgEase(c.revealConfig.pixEasing, C);
+    if (!e.pixCanvas) {
+      e.pixCanvas = ziaImgEl("canvas");
+      e.pixCtx = e.pixCanvas.getContext("2d");
+    }
+    const k = e.pixCanvas;
+    const _ = e.pixCtx;
+    if (k.width !== F || k.height !== M) {
+      k.width = F;
+      k.height = M;
+    }
+    if (!e.pixDrop) {
+      e.pixDrop = ziaImgEl("canvas");
+      e.pixDropCtx = e.pixDrop.getContext("2d");
+    }
+    const W = e.pixDrop;
+    const j = e.pixDropCtx;
+    if (W.width !== F || W.height !== M || !e.pixDropImgData) {
+      W.width = F;
+      W.height = M;
+      e.pixDropImgData = j.createImageData(F, M);
+      const R = e.pixDropImgData.data;
+      for (let X = 0; X < R.length; X += 4) {
+        R[X] = 255;
+        R[X + 1] = 255;
+        R[X + 2] = 255;
+      }
+    }
+    const S = 0.07;
+    const G = 1 / (2 * S);
+    if (!e.pixDropPattern || e.pixDropPatternW !== F || e.pixDropPatternH !== M || e.pixDropRevealStart !== e.revealStartMs) {
+      e.pixDropPattern = new Float32Array(d);
+      const R = S;
+      const X = 1 - 2 * S;
+      for (let A = 0; A < e.pixDropPattern.length; A++) {
+        e.pixDropPattern[A] = R + Math.random() * X;
+      }
+      e.pixDropPatternW = F;
+      e.pixDropPatternH = M;
+      e.pixDropRevealStart = e.revealStartMs;
+    }
+    const V = e.pixDropImgData.data;
+    const ae = e.pixDropPattern;
+    const H = g > 3e-3 && m != null;
+    for (let R = 0; R < ae.length; R++) {
+      const X = ae[R];
+      let A = 0.5 + (X - y) * G;
+      A = A < 0 ? 0 : A > 1 ? 1 : A;
+      if (H) {
+        const pe = 1 - Math.abs(y - X) * 6.25;
+        if (pe > 0) {
+          const ce = m(R, v) * (1 - P) + m(R, b) * P;
+          A += (ce - 0.5) * g * 1.6 * pe;
+          A = A < 0 ? 0 : A > 1 ? 1 : A;
+        }
+      }
+      V[R * 4 + 3] = (A * 255 + 0.5) | 0;
+    }
+    j.putImageData(e.pixDropImgData, 0, 0);
+    const cover = ziaImgCover(e, a, s, h);
+    _.globalCompositeOperation = "source-over";
+    _.clearRect(0, 0, F, M);
+    _.imageSmoothingEnabled = true;
+    _.imageSmoothingQuality = "high";
+    _.drawImage(cover, 0, 0, s, h, 0, 0, F, M);
+    _.globalCompositeOperation = "destination-in";
+    _.imageSmoothingEnabled = false;
+    _.drawImage(W, 0, 0);
+    _.globalCompositeOperation = "source-over";
+    t.imageSmoothingEnabled = true;
+    t.imageSmoothingQuality = "high";
+    t.drawImage(cover, 0, 0);
+    t.imageSmoothingEnabled = false;
+    t.drawImage(k, 0, 0, F, M, 0, 0, s, h);
+    t.imageSmoothingEnabled = true;
+    _.globalCompositeOperation = "source-over";
+    _.clearRect(0, 0, F, M);
+    _.imageSmoothingEnabled = true;
+    _.imageSmoothingQuality = "high";
+    _.drawImage(e.maskGrad, 0, 0, F, M);
+    t.imageSmoothingEnabled = false;
+    t.globalCompositeOperation = "destination-in";
+    t.drawImage(k, 0, 0, F, M, 0, 0, s, h);
+    t.imageSmoothingEnabled = true;
+    t.globalCompositeOperation = "source-over";
+  }
+
+  // the overlay's state machine: idle -> reveal -> hold -> hide -> idle (dist: aa).
+  // "simple" runs a reveal / hide as a plain crossfade, every frame: for
+  // reduced motion, and when there's no WebGL
+  function ziaImgCreateReveal(inst, canvas, setShaderOpacity) {
+    const t = canvas.getContext("2d");
+    // the two canvases' fade levels now, so a hide starts from wherever the
+    // dissolve had got to (from the hold, as in the package: 0 and 1)
+    let shaderLevel = 1;
+    let overlayLevel = 1;
+    const setShader = (v) => {
+      shaderLevel = v;
+      setShaderOpacity(v);
+    };
+    const setOverlay = (v) => {
+      overlayLevel = v;
+      ziaImgOpacity(t.canvas, v);
+    };
+    const a = {
+      active: false,
+      phase: "idle",
+      simple: false,
+      revealStartMs: 0,
+      holdStartMs: 0,
+      hideStartMs: 0,
+      hideDurationMs: ZIA_IMG_HIDE_MS,
+      hideShaderFrom: 0,
+      hideOverlayFrom: 1,
+      image: null,
+      onRevealComplete: null,
+      sampleCanvas: null,
+      sampleCtx: null,
+      sampleImgData: null,
+      sampleDataCache: null,
+      sampleFrameCounter: 0,
+      maskGrad: null,
+      maskGradCtx: null,
+      maskImgData: null,
+      gsFlickerTable: null,
+      pixCanvas: null,
+      pixCtx: null,
+      pixDrop: null,
+      pixDropCtx: null,
+      pixDropImgData: null,
+      pixDropPattern: null,
+      pixDropPatternW: 0,
+      pixDropPatternH: 0,
+      pixDropRevealStart: -1,
+      coverA: null,
+      holdPaintedImg: null,
+      holdPaintedW: 0,
+      holdPaintedH: 0,
+      sampleGpuCanvas: null,
+      sampleGpuCtx: null,
+    };
+
+    function done() {
+      const cb = a.onRevealComplete;
+      a.onRevealComplete = null;
+      if (cb) {
+        try {
+          cb();
+        } catch (err) {
+          console.error(err);
+        }
+      }
+    }
+
+    // the whole image, as the hold phase paints it
+    function paintFull() {
+      const m = Math.max(1, Math.floor(inst.cssWidth * inst.canvasDpr));
+      const v = Math.max(1, Math.floor(inst.cssHeight * inst.canvasDpr));
+      if (t.canvas.width !== m || t.canvas.height !== v) {
+        t.canvas.width = m;
+        t.canvas.height = v;
+        a.holdPaintedImg = null;
+      }
+      if (t.canvas.style.filter !== "none") {
+        t.canvas.style.filter = "none";
+      }
+      if (a.holdPaintedImg !== a.image || a.holdPaintedW !== m || a.holdPaintedH !== v) {
+        t.clearRect(0, 0, m, v);
+        t.globalCompositeOperation = "source-over";
+        t.globalAlpha = 1;
+        t.imageSmoothingEnabled = true;
+        t.imageSmoothingQuality = "high";
+        t.drawImage(ziaImgCover(a, a.image, m, v), 0, 0);
+        a.holdPaintedImg = a.image;
+        a.holdPaintedW = m;
+        a.holdPaintedH = v;
+      }
+    }
+
+    function endHide() {
+      a.active = false;
+      a.phase = "idle";
+      a.simple = false;
+      setOverlay(1);
+      t.clearRect(0, 0, t.canvas.width, t.canvas.height);
+      setShader(1);
+      a.image = null;
+      a.coverA = null;
+      a.holdPaintedImg = null;
+    }
+
+    return {
+      afterShaderFrame(eng, c, f) {
+        if (!a.active) {
+          if (t.canvas.style.filter && t.canvas.style.filter !== "none") {
+            t.canvas.style.filter = "none";
+          }
+          return;
+        }
+        if (a.simple) {
+          return;
+        }
+        const { duration: s, easingKey: h } = ziaImgRevealTiming(c.preset);
+        if (a.phase === "reveal" && a.image) {
+          const g = (f - a.revealStartMs) / 1e3;
+          const m = Math.min(g / s, 1);
+          const v = ziaImgEase(h, m);
+          setShader(1 - v);
+          ziaImgRevealFrame(a, eng, c, t);
+          if (m >= 1) {
+            a.phase = "hold";
+            a.holdStartMs = f;
+            setShader(0);
+            done();
+          }
+        } else if (a.phase === "hold" && a.image) {
+          paintFull();
+          setShader(0);
+        } else if (a.phase === "hide") {
+          const g = f - a.hideStartMs;
+          const m = Math.min(g / Math.max(1, a.hideDurationMs), 1);
+          setOverlay(a.hideOverlayFrom * (1 - m));
+          setShader(a.hideShaderFrom + (1 - a.hideShaderFrom) * m);
+          if (m >= 1) {
+            endHide();
+          }
+        }
+      },
+      // the reduced-motion / no-WebGL crossfades; true while one runs
+      stepSimple(now) {
+        if (!a.active || !a.simple) {
+          return false;
+        }
+        if (a.phase === "reveal") {
+          if (inst.cssWidth < 1 || inst.cssHeight < 1) {
+            return true;
+          }
+          paintFull();
+          const k = Math.min(1, (now - a.revealStartMs) / ZIA_IMG_FADE_MS);
+          setOverlay(k);
+          setShader(1 - k);
+          if (k >= 1) {
+            a.phase = "hold";
+            a.holdStartMs = now;
+            setShader(0);
+            done();
+            return false;
+          }
+          return true;
+        }
+        if (a.phase === "hide") {
+          const m = Math.min((now - a.hideStartMs) / Math.max(1, a.hideDurationMs), 1);
+          setOverlay(a.hideOverlayFrom * (1 - m));
+          setShader(a.hideShaderFrom + (1 - a.hideShaderFrom) * m);
+          if (m >= 1) {
+            endHide();
+            return false;
+          }
+          return true;
+        }
+        return false;
+      },
+      startReveal(l) {
+        a.image = l.image;
+        a.onRevealComplete = l.onRevealComplete || null;
+        a.revealStartMs = performance.now();
+        a.phase = "reveal";
+        a.active = true;
+        a.simple = !!l.simple;
+        a.sampleFrameCounter = 0;
+        a.sampleDataCache = null;
+        a.holdPaintedImg = null;
+        setOverlay(a.simple ? 0 : 1);
+      },
+      startHide(ms, simple) {
+        if (!a.active || a.phase === "hide") {
+          return false;
+        }
+        a.hideStartMs = performance.now();
+        // (the package jumps the shader to 0 here even mid-dissolve: a pop)
+        a.hideShaderFrom = shaderLevel;
+        a.hideOverlayFrom = overlayLevel;
+        if (a.phase === "hold") {
+          // the package's loop kept the (hidden) shader's clock running while
+          // the image was held; this one skips those frames, so it catches up
+          inst.accumulatedTime += Math.max(0, a.hideStartMs - a.holdStartMs) / 1e3;
+        }
+        a.phase = "hide";
+        a.hideDurationMs = ms;
+        if (simple) {
+          a.simple = true;
+        }
+        return true;
+      },
+      // jumps a running dissolve to its end, or a hide to idle
+      finishNow() {
+        if (!a.active || !a.image) {
+          if (a.active && a.phase === "hide") {
+            endHide();
+          }
+          return;
+        }
+        if (a.phase === "reveal") {
+          a.simple = true;
+          a.phase = "hold";
+          a.holdStartMs = performance.now();
+          setOverlay(1);
+          paintFull();
+          setShader(0);
+          done();
+        } else if (a.phase === "hide") {
+          endHide();
+        }
+      },
+      repaintHold() {
+        if (a.active && a.phase === "hold" && a.image && inst.cssWidth >= 1 && inst.cssHeight >= 1) {
+          paintFull();
+        }
+      },
+      churns() {
+        return !(a.active && (a.simple || a.phase === "hold"));
+      },
+      isActive() {
+        return a.active;
+      },
+      phase() {
+        return a.phase;
+      },
+      dispose() {
+        a.active = false;
+        a.phase = "idle";
+        a.onRevealComplete = null;
+        for (const key of Object.keys(a)) {
+          if (a[key] && typeof a[key] === "object") {
+            a[key] = null;
+          }
+        }
+      },
+    };
+  }
+
+  // a copy of the source's pixels now, so a later redraw of it can't change the reveal
+  function ziaImgSnapshot(src) {
+    if (!src) {
+      return null;
+    }
+    let w = 0;
+    let h = 0;
+    if (src.localName === "img") {
+      if (!src.complete) {
+        return null;
+      }
+      w = src.naturalWidth;
+      h = src.naturalHeight;
+    } else if (src.localName === "video") {
+      w = src.videoWidth;
+      h = src.videoHeight;
+    } else {
+      w = src.width;
+      h = src.height;
+    }
+    w = Math.floor(w);
+    h = Math.floor(h);
+    if (!(w > 0 && h > 0)) {
+      return null;
+    }
+    const c = ziaImgEl("canvas");
+    c.width = w;
+    c.height = h;
+    try {
+      c.getContext("2d").drawImage(src, 0, 0, w, h);
+    } catch (err) {
+      return null;
+    }
+    return c;
+  }
+
+  function ziaImgFx(host, opts) {
+    opts = opts || {};
+    if (!host || !host.ownerDocument) {
+      throw new TypeError("ziaImgFx: needs a host element");
+    }
+    const eng = ziaImgEngine();
+    const name = Object.hasOwn(ZIA_IMG_PRESETS, opts.preset) ? opts.preset : "pixels-organic";
+    const fixedRadius = Number.isFinite(opts.radius) ? Math.max(0, opts.radius) : null;
+    let dark = opts.dark !== false;
+    // (the preset with its dissolve stretched or squeezed to revealSeconds)
+    const tuned = (preset) => {
+      const want = Number(opts.revealSeconds);
+      const r = preset.revealConfig;
+      if (!(want > 0) || !r?.duration) {
+        return preset;
+      }
+      const k = want / r.duration;
+      return { ...preset, revealConfig: { ...r, duration: want, pixDuration: r.pixDuration * k, dotDuration: r.dotDuration * k } };
+    };
+
+    const layer = ziaImgEl("div");
+    layer.className = "zia-imgfx";
+    layer.setAttribute("aria-hidden", "true");
+    const shaderCanvas = ziaImgEl("canvas");
+    shaderCanvas.className = "zia-imgfx-shader";
+    const overlay = ziaImgEl("canvas");
+    overlay.className = "zia-imgfx-overlay";
+    layer.append(shaderCanvas, overlay);
+
+    // over a replaced element (Zia's thumbnail <canvas>): its next sibling, on
+    // its box; anything else: inside it, filling it
+    const over = ZIA_IMG_REPLACED.test(host.localName || "");
+    let hostPosition = null;
+    if (over) {
+      layer.setAttribute("zia-imgfx-over", "");
+      host.after(layer);
+    } else {
+      if (getComputedStyle(host).position === "static") {
+        hostPosition = host.style.position;
+        host.style.position = "relative";
+      }
+      host.appendChild(layer);
+    }
+
+    const inst = {
+      canvas: shaderCanvas,
+      ctx: shaderCanvas.getContext("2d"),
+      cssWidth: 0,
+      cssHeight: 0,
+      dpr: Math.min(window.devicePixelRatio || 1, ZIA_IMG_MAX_DPR),
+      canvasDpr: Math.min(window.devicePixelRatio || 1, ZIA_IMG_MAX_CANVAS_DPR),
+      preset: tuned(ZIA_IMG_PRESETS[name].modes[dark ? "dark" : "light"]),
+      cardBgOverride: typeof opts.cardBg === "string" && opts.cardBg ? opts.cardBg : null,
+      palette: Array.isArray(opts.palette) ? opts.palette.slice() : null,
+      colorsOverride: null,
+      colors: null,
+      strength: Math.max(0, Math.min(1, Number.isFinite(opts.strength) ? opts.strength : 1)),
+      inView: true,
+      visible: !document.hidden,
+      paused: false,
+      reduced: !!eng.reduceQuery?.matches,
+      uniformsDirty: true,
+      reveal: null,
+      accumulatedTime: Math.random() * 1e3,
+      shownAtMs: -1,
+      pending: null,
+      minChurnMs: Math.max(0, Number(opts.minChurnMs) || 0),
+      destroyed: false,
+    };
+    inst.colorsOverride = inst.palette && ziaImgRetint(inst.preset, inst.palette);
+    // strength is the shader canvas's opacity, under the reveal's own fade
+    const setShaderOpacity = (v) => ziaImgOpacity(shaderCanvas, v * inst.strength);
+    setShaderOpacity(1);
+    inst.reveal = ziaImgCreateReveal(inst, overlay, setShaderOpacity);
+
+    const paintCard = () => {
+      layer.style.backgroundColor = inst.cardBgOverride ?? inst.preset.cardBg;
+    };
+    paintCard();
+
+    let radius = -1;
+    function sync() {
+      if (inst.destroyed) {
+        return;
+      }
+      let w;
+      let h;
+      if (over) {
+        // (its padding box, inside its borders: a thumbnail's bottom rule stays visible)
+        w = host.clientWidth;
+        h = host.clientHeight;
+        layer.style.left = `${host.offsetLeft + host.clientLeft}px`;
+        layer.style.top = `${host.offsetTop + host.clientTop}px`;
+        layer.style.width = `${w}px`;
+        layer.style.height = `${h}px`;
+      } else {
+        w = host.clientWidth;
+        h = host.clientHeight;
+      }
+      let r = fixedRadius;
+      if (r == null) {
+        const value = getComputedStyle(host).borderTopLeftRadius;
+        const n = parseFloat(value);
+        r = Number.isFinite(n) && n > 0 ? (value.endsWith("%") ? (n / 100) * Math.min(w, h) : n) : 0;
+      }
+      if (r !== radius) {
+        radius = r;
+        layer.style.borderRadius = `${r}px`;
+      }
+      const d = Math.min(window.devicePixelRatio || 1, ZIA_IMG_MAX_DPR);
+      if (w === inst.cssWidth && h === inst.cssHeight && d === inst.dpr) {
+        return;
+      }
+      inst.cssWidth = w;
+      inst.cssHeight = h;
+      inst.dpr = d;
+      inst.canvasDpr = Math.min(window.devicePixelRatio || 1, ZIA_IMG_MAX_CANVAS_DPR);
+      if (w >= 1 && h >= 1) {
+        if (!ziaImgGLOk(eng) && inst.shownAtMs < 0 && inst.visible) {
+          inst.shownAtMs = performance.now();
+        }
+        ziaImgRenderNow(eng, inst);
+        inst.reveal.repaintHold();
+      }
+      ziaImgKick(eng);
+    }
+
+    const ro = new ResizeObserver(sync);
+    ro.observe(host);
+    let io = null;
+    if (typeof IntersectionObserver === "function") {
+      io = new IntersectionObserver(
+        (entries) => {
+          inst.inView = entries[entries.length - 1].isIntersecting;
+          ziaImgUpdateVisible(eng, inst);
+        },
+        { rootMargin: "64px" },
+      );
+      io.observe(layer);
+    }
+    eng.instances.add(inst);
+    sync();
+    ziaImgKick(eng);
+
+    return {
+      element: layer,
+      // dissolves into a snapshot of source (canvas, ImageBitmap, loaded <img>),
+      // then holds it; false if it can't (nothing to show, or an image is
+      // already dissolving in or shown: as the package, hide() first). Asked
+      // during a hide, it starts when the hide ends; asked again before it
+      // starts (minChurnMs), the newer source replaces the older
+      reveal(source, options) {
+        if (inst.destroyed || (inst.reveal.isActive() && inst.reveal.phase() !== "hide")) {
+          return false;
+        }
+        const image = ziaImgSnapshot(source);
+        if (!image) {
+          return false;
+        }
+        inst.pending = { image, onDone: options && typeof options.onDone === "function" ? options.onDone : null };
+        sync();
+        ziaImgTryStart(eng, inst, performance.now());
+        ziaImgKick(eng);
+        return true;
+      },
+      hide() {
+        if (inst.destroyed) {
+          return;
+        }
+        inst.pending = null;
+        // (the shader canvas sits at opacity 0 while held: the loop draws a
+        // fresh frame before it fades back in)
+        inst.reveal.startHide(ZIA_IMG_HIDE_MS, inst.reduced || !ziaImgGLOk(eng));
+        ziaImgKick(eng);
+      },
+      setDark(value) {
+        if (inst.destroyed || !!value === dark) {
+          return;
+        }
+        dark = !!value;
+        inst.preset = tuned(ZIA_IMG_PRESETS[name].modes[dark ? "dark" : "light"]);
+        inst.colorsOverride = inst.palette && ziaImgRetint(inst.preset, inst.palette);
+        inst.colors = null;
+        inst.uniformsDirty = true;
+        paintCard();
+        ziaImgRenderNow(eng, inst);
+      },
+      destroy() {
+        if (inst.destroyed) {
+          return;
+        }
+        inst.destroyed = true;
+        inst.pending = null;
+        ro.disconnect();
+        io?.disconnect();
+        eng.instances.delete(inst);
+        if (eng.lastInstance === inst) {
+          eng.lastInstance = null;
+        }
+        inst.reveal.dispose();
+        layer.remove();
+        if (hostPosition !== null) {
+          host.style.position = hostPosition;
+        }
+        ziaImgRelease(eng);
+      },
+    };
+  }
   function safely(name, fn) {
     try {
       fn();
@@ -18706,6 +24637,7 @@
     safely("watchTitleOnly", watchTitleOnly);
     safely("watchCenteredAddress", watchCenteredAddress);
     safely("watchScreenshotButtons", watchScreenshotButtons);
+    safely("watchUltra", watchUltra);
     safely("addDownloadProgress", addDownloadProgress);
     safely("flyFirstDownloadToButton", flyFirstDownloadToButton);
     safely("flyDownloadRows", flyDownloadRows);
